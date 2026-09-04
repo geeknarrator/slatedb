@@ -628,7 +628,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbbuilder_with_db_cache()
 		})
-		if checksum != 61829 {
+		if checksum != 47822 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbbuilder_with_db_cache: UniFFI API checksum mismatch")
 		}
@@ -725,6 +725,24 @@ func uniffiCheckChecksums() {
 	}
 	{
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_dbreaderbuilder_with_db_cache()
+		})
+		if checksum != 34968 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreaderbuilder_with_db_cache: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_dbreaderbuilder_with_db_cache_disabled()
+		})
+		if checksum != 43175 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreaderbuilder_with_db_cache_disabled: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbreaderbuilder_with_filter_policies()
 		})
 		if checksum != 12871 {
@@ -817,7 +835,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_db_evict_cached_sst()
 		})
-		if checksum != 60099 {
+		if checksum != 13615 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_db_evict_cached_sst: UniFFI API checksum mismatch")
 		}
@@ -829,6 +847,15 @@ func uniffiCheckChecksums() {
 		if checksum != 42157 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_db_flush: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_db_flush_cache_to_disk()
+		})
+		if checksum != 18947 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_db_flush_cache_to_disk: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -988,7 +1015,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_db_warm_sst()
 		})
-		if checksum != 8802 {
+		if checksum != 54684 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_db_warm_sst: UniFFI API checksum mismatch")
 		}
@@ -1015,9 +1042,18 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbreader_evict_cached_sst()
 		})
-		if checksum != 31819 {
+		if checksum != 18747 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreader_evict_cached_sst: UniFFI API checksum mismatch")
+		}
+	}
+	{
+		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
+			return C.uniffi_slatedb_uniffi_checksum_method_dbreader_flush_cache_to_disk()
+		})
+		if checksum != 25448 {
+			// If this happens try cleaning and rebuilding your project
+			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreader_flush_cache_to_disk: UniFFI API checksum mismatch")
 		}
 	}
 	{
@@ -1114,7 +1150,7 @@ func uniffiCheckChecksums() {
 		checksum := rustCall(func(_uniffiStatus *C.RustCallStatus) C.uint16_t {
 			return C.uniffi_slatedb_uniffi_checksum_method_dbreader_warm_sst()
 		})
-		if checksum != 26897 {
+		if checksum != 4708 {
 			// If this happens try cleaning and rebuilding your project
 			panic("slatedb: uniffi_slatedb_uniffi_checksum_method_dbreader_warm_sst: UniFFI API checksum mismatch")
 		}
@@ -3292,6 +3328,20 @@ type DbInterface interface {
 	EvictCachedSst(sstId SsTableId) error
 	// Flushes the default storage layer.
 	Flush() error
+	// Sends this Db's cached data to disk.
+	//
+	// This moves data for this instance's scope id from memory to disk.
+	// It frees memory now, and protects the data from an ungraceful
+	// process exit later. A later instance with the same scope id can
+	// read the data back from disk.
+	//
+	// This affects the whole scope, not only this instance's own reads
+	// and writes. If another instance uses the same scope id, this call
+	// also flushes that instance's data.
+	//
+	// Does nothing if no block cache is set, or if the cache has no disk
+	// storage.
+	FlushCacheToDisk() error
 	// Flushes according to the provided flush options.
 	FlushWithOptions(options FlushOptions) error
 	// Reads the current value for `key`.
@@ -3502,6 +3552,50 @@ func (_self *Db) Flush() error {
 		// liftFn
 		func(_ struct{}) struct{} { return struct{}{} },
 		C.uniffi_slatedb_uniffi_fn_method_db_flush(
+			_pointer),
+		// pollFn
+		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_poll_void(handle, continuation, data)
+		},
+		// freeFn
+		func(handle C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_free_void(handle)
+		},
+	)
+
+	if err == nil {
+		return nil
+	}
+
+	return err
+}
+
+// Sends this Db's cached data to disk.
+//
+// This moves data for this instance's scope id from memory to disk.
+// It frees memory now, and protects the data from an ungraceful
+// process exit later. A later instance with the same scope id can
+// read the data back from disk.
+//
+// This affects the whole scope, not only this instance's own reads
+// and writes. If another instance uses the same scope id, this call
+// also flushes that instance's data.
+//
+// Does nothing if no block cache is set, or if the cache has no disk
+// storage.
+func (_self *Db) FlushCacheToDisk() error {
+	_pointer := _self.ffiObject.incrementPointer("*Db")
+	defer _self.ffiObject.decrementPointer()
+	_, err := uniffiRustCallAsync[*Error](
+		FfiConverterErrorINSTANCE,
+		// completeFn
+		func(handle C.uint64_t, status *C.RustCallStatus) struct{} {
+			C.ffi_slatedb_uniffi_rust_future_complete_void(handle, status)
+			return struct{}{}
+		},
+		// liftFn
+		func(_ struct{}) struct{} { return struct{}{} },
+		C.uniffi_slatedb_uniffi_fn_method_db_flush_cache_to_disk(
 			_pointer),
 		// pollFn
 		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
@@ -4252,8 +4346,10 @@ func (_ FfiDestroyerDb) Destroy(value *Db) {
 type DbBuilderInterface interface {
 	// Opens the database and consumes this builder.
 	Build() (*Db, error)
-	// Sets DB cache.
-	WithDbCache(dbCache *DbCache) error
+	// Sets DB cache. `db_cache_id` isolates this database's entries from any other
+	// `Db`/`DbReader` sharing the same cache; the caller is responsible for its
+	// uniqueness and stability across reopens.
+	WithDbCache(dbCache *DbCache, dbCacheId uint64) error
 	// Disables the SST block and metadata cache.
 	WithDbCacheDisabled() error
 	// Sets the filter policies used for SST filter construction and evaluation.
@@ -4331,13 +4427,15 @@ func (_self *DbBuilder) Build() (*Db, error) {
 	return res, err
 }
 
-// Sets DB cache.
-func (_self *DbBuilder) WithDbCache(dbCache *DbCache) error {
+// Sets DB cache. `db_cache_id` isolates this database's entries from any other
+// `Db`/`DbReader` sharing the same cache; the caller is responsible for its
+// uniqueness and stability across reopens.
+func (_self *DbBuilder) WithDbCache(dbCache *DbCache, dbCacheId uint64) error {
 	_pointer := _self.ffiObject.incrementPointer("*DbBuilder")
 	defer _self.ffiObject.decrementPointer()
 	_, _uniffiErr := rustCallWithError[*Error](FfiConverterError{}, func(_uniffiStatus *C.RustCallStatus) bool {
 		C.uniffi_slatedb_uniffi_fn_method_dbbuilder_with_db_cache(
-			_pointer, FfiConverterDbCacheINSTANCE.Lower(dbCache), _uniffiStatus)
+			_pointer, FfiConverterDbCacheINSTANCE.Lower(dbCache), FfiConverterUint64INSTANCE.Lower(dbCacheId), _uniffiStatus)
 		return false
 	})
 	return _uniffiErr.AsError()
@@ -4815,6 +4913,20 @@ type DbReaderInterface interface {
 	//
 	// If no block cache is configured, returns `Ok(())`.
 	EvictCachedSst(sstId SsTableId) error
+	// Sends this reader's cached data to disk.
+	//
+	// This moves data for this instance's scope id from memory to disk.
+	// It frees memory now, and protects the data from an ungraceful
+	// process exit later. A later instance with the same scope id can
+	// read the data back from disk.
+	//
+	// This affects the whole scope, not only this instance's own reads
+	// and writes. If another instance uses the same scope id, this call
+	// also flushes that instance's data.
+	//
+	// Does nothing if no block cache is set, or if the cache has no disk
+	// storage.
+	FlushCacheToDisk() error
 	// Reads the current value for `key`.
 	Get(key []byte) (*[]byte, error)
 	// Reads the current row version for `key`, including metadata.
@@ -4866,6 +4978,50 @@ func (_self *DbReader) EvictCachedSst(sstId SsTableId) error {
 		func(_ struct{}) struct{} { return struct{}{} },
 		C.uniffi_slatedb_uniffi_fn_method_dbreader_evict_cached_sst(
 			_pointer, FfiConverterSsTableIdINSTANCE.Lower(sstId)),
+		// pollFn
+		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_poll_void(handle, continuation, data)
+		},
+		// freeFn
+		func(handle C.uint64_t) {
+			C.ffi_slatedb_uniffi_rust_future_free_void(handle)
+		},
+	)
+
+	if err == nil {
+		return nil
+	}
+
+	return err
+}
+
+// Sends this reader's cached data to disk.
+//
+// This moves data for this instance's scope id from memory to disk.
+// It frees memory now, and protects the data from an ungraceful
+// process exit later. A later instance with the same scope id can
+// read the data back from disk.
+//
+// This affects the whole scope, not only this instance's own reads
+// and writes. If another instance uses the same scope id, this call
+// also flushes that instance's data.
+//
+// Does nothing if no block cache is set, or if the cache has no disk
+// storage.
+func (_self *DbReader) FlushCacheToDisk() error {
+	_pointer := _self.ffiObject.incrementPointer("*DbReader")
+	defer _self.ffiObject.decrementPointer()
+	_, err := uniffiRustCallAsync[*Error](
+		FfiConverterErrorINSTANCE,
+		// completeFn
+		func(handle C.uint64_t, status *C.RustCallStatus) struct{} {
+			C.ffi_slatedb_uniffi_rust_future_complete_void(handle, status)
+			return struct{}{}
+		},
+		// liftFn
+		func(_ struct{}) struct{} { return struct{}{} },
+		C.uniffi_slatedb_uniffi_fn_method_dbreader_flush_cache_to_disk(
+			_pointer),
 		// pollFn
 		func(handle C.uint64_t, continuation C.UniffiRustFutureContinuationCallback, data C.uint64_t) {
 			C.ffi_slatedb_uniffi_rust_future_poll_void(handle, continuation, data)
@@ -5305,6 +5461,12 @@ func (_ FfiDestroyerDbReader) Destroy(value *DbReader) {
 type DbReaderBuilderInterface interface {
 	// Opens the reader and consumes this builder.
 	Build() (*DbReader, error)
+	// Sets DB cache. `db_cache_id` isolates this reader's entries from any other
+	// `Db`/`DbReader` sharing the same cache; the caller is responsible for its
+	// uniqueness and stability across reopens.
+	WithDbCache(dbCache *DbCache, dbCacheId uint64) error
+	// Disables the SST block and metadata cache.
+	WithDbCacheDisabled() error
 	// Sets the filter policies used when decoding SST filter blocks.
 	//
 	// Must match (or be a superset of) the writer's policies so SST filter
@@ -5373,6 +5535,32 @@ func (_self *DbReaderBuilder) Build() (*DbReader, error) {
 	}
 
 	return res, err
+}
+
+// Sets DB cache. `db_cache_id` isolates this reader's entries from any other
+// `Db`/`DbReader` sharing the same cache; the caller is responsible for its
+// uniqueness and stability across reopens.
+func (_self *DbReaderBuilder) WithDbCache(dbCache *DbCache, dbCacheId uint64) error {
+	_pointer := _self.ffiObject.incrementPointer("*DbReaderBuilder")
+	defer _self.ffiObject.decrementPointer()
+	_, _uniffiErr := rustCallWithError[*Error](FfiConverterError{}, func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_slatedb_uniffi_fn_method_dbreaderbuilder_with_db_cache(
+			_pointer, FfiConverterDbCacheINSTANCE.Lower(dbCache), FfiConverterUint64INSTANCE.Lower(dbCacheId), _uniffiStatus)
+		return false
+	})
+	return _uniffiErr.AsError()
+}
+
+// Disables the SST block and metadata cache.
+func (_self *DbReaderBuilder) WithDbCacheDisabled() error {
+	_pointer := _self.ffiObject.incrementPointer("*DbReaderBuilder")
+	defer _self.ffiObject.decrementPointer()
+	_, _uniffiErr := rustCallWithError[*Error](FfiConverterError{}, func(_uniffiStatus *C.RustCallStatus) bool {
+		C.uniffi_slatedb_uniffi_fn_method_dbreaderbuilder_with_db_cache_disabled(
+			_pointer, _uniffiStatus)
+		return false
+	})
+	return _uniffiErr.AsError()
 }
 
 // Sets the filter policies used when decoding SST filter blocks.
@@ -10874,6 +11062,48 @@ func (_ FfiDestroyerSsTableHandle) Destroy(value SsTableHandle) {
 	value.Destroy()
 }
 
+// Compacted SSTable identifier.
+type SsTableId struct {
+	// SST ULID string.
+	Value string
+}
+
+func (r *SsTableId) Destroy() {
+	FfiDestroyerString{}.Destroy(r.Value)
+}
+
+type FfiConverterSsTableId struct{}
+
+var FfiConverterSsTableIdINSTANCE = FfiConverterSsTableId{}
+
+func (c FfiConverterSsTableId) Lift(rb RustBufferI) SsTableId {
+	return LiftFromRustBuffer[SsTableId](c, rb)
+}
+
+func (c FfiConverterSsTableId) Read(reader io.Reader) SsTableId {
+	return SsTableId{
+		FfiConverterStringINSTANCE.Read(reader),
+	}
+}
+
+func (c FfiConverterSsTableId) Lower(value SsTableId) C.RustBuffer {
+	return LowerIntoRustBuffer[SsTableId](c, value)
+}
+
+func (c FfiConverterSsTableId) LowerExternal(value SsTableId) ExternalCRustBuffer {
+	return RustBufferFromC(LowerIntoRustBuffer[SsTableId](c, value))
+}
+
+func (c FfiConverterSsTableId) Write(writer io.Writer, value SsTableId) {
+	FfiConverterStringINSTANCE.Write(writer, value.Value)
+}
+
+type FfiDestroyerSsTableId struct{}
+
+func (_ FfiDestroyerSsTableId) Destroy(value SsTableId) {
+	value.Destroy()
+}
+
 // SSTable metadata.
 type SsTableInfo struct {
 	// First entry in the SSTable, if any.
@@ -12731,80 +12961,6 @@ func (FfiConverterSourceId) Write(writer io.Writer, value SourceId) {
 type FfiDestroyerSourceId struct{}
 
 func (_ FfiDestroyerSourceId) Destroy(value SourceId) {
-	value.Destroy()
-}
-
-// SSTable identifier.
-type SsTableId interface {
-	Destroy()
-}
-
-// WAL SST identified by numeric WAL ID.
-type SsTableIdWal struct {
-	Field0 uint64
-}
-
-func (e SsTableIdWal) Destroy() {
-	FfiDestroyerUint64{}.Destroy(e.Field0)
-}
-
-// Compacted SST identified by ULID string.
-type SsTableIdCompacted struct {
-	Field0 string
-}
-
-func (e SsTableIdCompacted) Destroy() {
-	FfiDestroyerString{}.Destroy(e.Field0)
-}
-
-type FfiConverterSsTableId struct{}
-
-var FfiConverterSsTableIdINSTANCE = FfiConverterSsTableId{}
-
-func (c FfiConverterSsTableId) Lift(rb RustBufferI) SsTableId {
-	return LiftFromRustBuffer[SsTableId](c, rb)
-}
-
-func (c FfiConverterSsTableId) Lower(value SsTableId) C.RustBuffer {
-	return LowerIntoRustBuffer[SsTableId](c, value)
-}
-
-func (c FfiConverterSsTableId) LowerExternal(value SsTableId) ExternalCRustBuffer {
-	return RustBufferFromC(LowerIntoRustBuffer[SsTableId](c, value))
-}
-func (FfiConverterSsTableId) Read(reader io.Reader) SsTableId {
-	id := readInt32(reader)
-	switch id {
-	case 1:
-		return SsTableIdWal{
-			FfiConverterUint64INSTANCE.Read(reader),
-		}
-	case 2:
-		return SsTableIdCompacted{
-			FfiConverterStringINSTANCE.Read(reader),
-		}
-	default:
-		panic(fmt.Sprintf("invalid enum value %v in FfiConverterSsTableId.Read()", id))
-	}
-}
-
-func (FfiConverterSsTableId) Write(writer io.Writer, value SsTableId) {
-	switch variant_value := value.(type) {
-	case SsTableIdWal:
-		writeInt32(writer, 1)
-		FfiConverterUint64INSTANCE.Write(writer, variant_value.Field0)
-	case SsTableIdCompacted:
-		writeInt32(writer, 2)
-		FfiConverterStringINSTANCE.Write(writer, variant_value.Field0)
-	default:
-		_ = variant_value
-		panic(fmt.Sprintf("invalid enum value `%v` in FfiConverterSsTableId.Write", value))
-	}
-}
-
-type FfiDestroyerSsTableId struct{}
-
-func (_ FfiDestroyerSsTableId) Destroy(value SsTableId) {
 	value.Destroy()
 }
 
@@ -14679,6 +14835,53 @@ func (FfiDestroyerSequenceSsTableHandle) Destroy(sequence []SsTableHandle) {
 	}
 }
 
+type FfiConverterSequenceSsTableId struct{}
+
+var FfiConverterSequenceSsTableIdINSTANCE = FfiConverterSequenceSsTableId{}
+
+func (c FfiConverterSequenceSsTableId) Lift(rb RustBufferI) []SsTableId {
+	return LiftFromRustBuffer[[]SsTableId](c, rb)
+}
+
+func (c FfiConverterSequenceSsTableId) Read(reader io.Reader) []SsTableId {
+	length := readInt32(reader)
+	if length == 0 {
+		return nil
+	}
+	result := make([]SsTableId, 0, length)
+	for i := int32(0); i < length; i++ {
+		result = append(result, FfiConverterSsTableIdINSTANCE.Read(reader))
+	}
+	return result
+}
+
+func (c FfiConverterSequenceSsTableId) Lower(value []SsTableId) C.RustBuffer {
+	return LowerIntoRustBuffer[[]SsTableId](c, value)
+}
+
+func (c FfiConverterSequenceSsTableId) LowerExternal(value []SsTableId) ExternalCRustBuffer {
+	return RustBufferFromC(LowerIntoRustBuffer[[]SsTableId](c, value))
+}
+
+func (c FfiConverterSequenceSsTableId) Write(writer io.Writer, value []SsTableId) {
+	if len(value) > math.MaxInt32 {
+		panic("[]SsTableId is too large to fit into Int32")
+	}
+
+	writeInt32(writer, int32(len(value)))
+	for _, item := range value {
+		FfiConverterSsTableIdINSTANCE.Write(writer, item)
+	}
+}
+
+type FfiDestroyerSequenceSsTableId struct{}
+
+func (FfiDestroyerSequenceSsTableId) Destroy(sequence []SsTableId) {
+	for _, value := range sequence {
+		FfiDestroyerSsTableId{}.Destroy(value)
+	}
+}
+
 type FfiConverterSequenceSsTableView struct{}
 
 var FfiConverterSequenceSsTableViewINSTANCE = FfiConverterSequenceSsTableView{}
@@ -14911,53 +15114,6 @@ type FfiDestroyerSequenceSourceId struct{}
 func (FfiDestroyerSequenceSourceId) Destroy(sequence []SourceId) {
 	for _, value := range sequence {
 		FfiDestroyerSourceId{}.Destroy(value)
-	}
-}
-
-type FfiConverterSequenceSsTableId struct{}
-
-var FfiConverterSequenceSsTableIdINSTANCE = FfiConverterSequenceSsTableId{}
-
-func (c FfiConverterSequenceSsTableId) Lift(rb RustBufferI) []SsTableId {
-	return LiftFromRustBuffer[[]SsTableId](c, rb)
-}
-
-func (c FfiConverterSequenceSsTableId) Read(reader io.Reader) []SsTableId {
-	length := readInt32(reader)
-	if length == 0 {
-		return nil
-	}
-	result := make([]SsTableId, 0, length)
-	for i := int32(0); i < length; i++ {
-		result = append(result, FfiConverterSsTableIdINSTANCE.Read(reader))
-	}
-	return result
-}
-
-func (c FfiConverterSequenceSsTableId) Lower(value []SsTableId) C.RustBuffer {
-	return LowerIntoRustBuffer[[]SsTableId](c, value)
-}
-
-func (c FfiConverterSequenceSsTableId) LowerExternal(value []SsTableId) ExternalCRustBuffer {
-	return RustBufferFromC(LowerIntoRustBuffer[[]SsTableId](c, value))
-}
-
-func (c FfiConverterSequenceSsTableId) Write(writer io.Writer, value []SsTableId) {
-	if len(value) > math.MaxInt32 {
-		panic("[]SsTableId is too large to fit into Int32")
-	}
-
-	writeInt32(writer, int32(len(value)))
-	for _, item := range value {
-		FfiConverterSsTableIdINSTANCE.Write(writer, item)
-	}
-}
-
-type FfiDestroyerSequenceSsTableId struct{}
-
-func (FfiDestroyerSequenceSsTableId) Destroy(sequence []SsTableId) {
-	for _, value := range sequence {
-		FfiDestroyerSsTableId{}.Destroy(value)
 	}
 }
 
