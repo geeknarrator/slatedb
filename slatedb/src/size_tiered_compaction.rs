@@ -374,6 +374,18 @@ impl SizeTieredCompactionScheduler {
                 return Some(self.create_compaction(&tree.prefix, compactable_run, dst));
             }
         }
+
+        if self.options.max_sorted_runs > 0 && tree.srs.len() >= self.options.max_sorted_runs {
+            let consolidation =
+                Self::build_compactable_run(f32::INFINITY, &tree.srs, 0, Some(tree));
+            if consolidation.len() >= 2 {
+                let consolidation = self.clamp_max(consolidation);
+                if let Some(back) = consolidation.back() {
+                    let dst = back.source.unwrap_sorted_run();
+                    return Some(self.create_compaction(&tree.prefix, consolidation, dst));
+                }
+            }
+        }
         None
     }
 
@@ -671,6 +683,54 @@ mod tests {
         let compaction = compactions.first().unwrap();
         let expected_compaction = create_sr_compaction(vec![4, 3, 2, 1]);
         assert_eq!(compaction.clone(), expected_compaction)
+    }
+
+    #[test]
+    fn test_max_sorted_runs_disabled_is_noop_for_dissimilar_runs() {
+        let scheduler = SizeTieredCompactionScheduler::default();
+        let state = &create_compactor_state(create_db_state(
+            VecDeque::new(),
+            vec![
+                create_sr2(4, 2),
+                create_sr2(3, 16),
+                create_sr2(2, 128),
+                create_sr2(1, 1024),
+                create_sr2(0, 8192),
+            ],
+        ));
+
+        let compactions = scheduler.propose(&state.into());
+
+        assert!(compactions.is_empty());
+    }
+
+    #[test]
+    fn test_max_sorted_runs_consolidates_dissimilar_runs_over_threshold() {
+        let scheduler = SizeTieredCompactionScheduler::new(
+            SizeTieredCompactionSchedulerOptions {
+                max_sorted_runs: 4,
+                ..SizeTieredCompactionSchedulerOptions::default()
+            },
+            4,
+        );
+        let state = &create_compactor_state(create_db_state(
+            VecDeque::new(),
+            vec![
+                create_sr2(4, 2),
+                create_sr2(3, 16),
+                create_sr2(2, 128),
+                create_sr2(1, 1024),
+                create_sr2(0, 8192),
+            ],
+        ));
+
+        let compactions = scheduler.propose(&state.into());
+
+        assert_eq!(compactions.len(), 1);
+        assert_eq!(
+            compactions.first().unwrap().clone(),
+            create_sr_compaction(vec![4, 3, 2, 1, 0])
+        );
     }
 
     #[test]
