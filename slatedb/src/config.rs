@@ -1472,10 +1472,16 @@ pub struct SizeTieredCompactionSchedulerOptions {
     /// size is less than this value times the min size of the runs currently included in C.
     pub include_size_threshold: f32,
 
-    /// When greater than zero, a tree whose sorted-run count is at or above this value is
-    /// consolidated regardless of the size-band grouping, bounded by `max_compaction_sources`.
-    /// Zero (the default) turns the trigger off and leaves scheduling unchanged.
-    pub max_sorted_runs: usize,
+    /// The sorted-run count that enables fallback consolidation for each tree.
+    /// Zero disables the trigger. This value does not impose a hard limit.
+    ///
+    /// When normal scheduling finds no work, the fallback ignores `min_compaction_sources`
+    /// and `include_size_threshold`. It requires at least two sources and respects
+    /// `max_compaction_sources`, source conflicts, and existing limits on compaction work.
+    ///
+    /// The fallback tries consecutive groups from newest to oldest. If a group exceeds
+    /// `max_compaction_sources`, it retains the oldest sources in that group.
+    pub sorted_run_consolidation_threshold: usize,
 }
 
 impl Default for SizeTieredCompactionSchedulerOptions {
@@ -1484,7 +1490,7 @@ impl Default for SizeTieredCompactionSchedulerOptions {
             min_compaction_sources: 4,
             max_compaction_sources: 8,
             include_size_threshold: 4.0,
-            max_sorted_runs: 0,
+            sorted_run_consolidation_threshold: 0,
         }
     }
 }
@@ -1521,11 +1527,11 @@ impl From<&HashMap<String, String>> for SizeTieredCompactionSchedulerOptions {
                         );
                     }
                 },
-                "max_sorted_runs" => match value.parse::<usize>() {
-                    Ok(parsed) => options.max_sorted_runs = parsed,
+                "sorted_run_consolidation_threshold" => match value.parse::<usize>() {
+                    Ok(parsed) => options.sorted_run_consolidation_threshold = parsed,
                     Err(err) => {
                         warn!(
-                            "invalid scheduler option value for max_sorted_runs: '{}': {}",
+                            "invalid scheduler option value for sorted_run_consolidation_threshold: '{}': {}",
                             value, err
                         );
                     }
@@ -1562,8 +1568,8 @@ impl From<SizeTieredCompactionSchedulerOptions> for HashMap<String, String> {
             options.include_size_threshold.to_string(),
         );
         map.insert(
-            "max_sorted_runs".to_string(),
-            options.max_sorted_runs.to_string(),
+            "sorted_run_consolidation_threshold".to_string(),
+            options.sorted_run_consolidation_threshold.to_string(),
         );
         map
     }
@@ -2142,7 +2148,7 @@ object_store_cache_options:
             min_compaction_sources: 3,
             max_compaction_sources: 9,
             include_size_threshold: 7.0,
-            max_sorted_runs: 5,
+            sorted_run_consolidation_threshold: 5,
         };
 
         let map: HashMap<String, String> = options.into();
@@ -2151,7 +2157,7 @@ object_store_cache_options:
         assert_eq!(roundtripped.min_compaction_sources, 3);
         assert_eq!(roundtripped.max_compaction_sources, 9);
         assert_eq!(roundtripped.include_size_threshold, 7.0);
-        assert_eq!(roundtripped.max_sorted_runs, 5);
+        assert_eq!(roundtripped.sorted_run_consolidation_threshold, 5);
     }
 
     #[test]
