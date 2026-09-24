@@ -50,7 +50,7 @@ use tokio::sync::oneshot;
 pub(crate) const WRITE_BATCH_TASK_NAME: &str = "writer";
 
 pub(crate) type WriteBatchResult = Result<WriteHandle, SlateDBError>;
-type BatchWriterFlushResult = (FlushResultFuture, Option<CheckpointBoundary>);
+pub(crate) type BatchWriterFlushResult = (FlushResultFuture, Option<CheckpointBoundary>);
 
 /// A message processed by the batch writer event loop.
 #[allow(clippy::large_enum_variant)]
@@ -362,6 +362,8 @@ impl DbInner {
         };
         let checkpoint_boundary = if freeze_memtable {
             let mut guard = self.state.write();
+            // The requested flush can still be in progress. Table files will cover
+            // the frozen writes, so the checkpoint can stop WAL replay at this earlier file.
             let replay_after_wal_id = guard
                 .state()
                 .core()
@@ -406,15 +408,24 @@ impl DbInner {
         &self,
         freeze_memtable: bool,
     ) -> Result<Option<CheckpointBoundary>, SlateDBError> {
+        let (flush_result, checkpoint_boundary) =
+            self.begin_batch_writer_flush(freeze_memtable).await?;
+        flush_result.await?;
+        Ok(checkpoint_boundary)
+    }
+
+    /// Waits for the writer to start the flush and capture the optional boundary.
+    pub(crate) async fn begin_batch_writer_flush(
+        &self,
+        freeze_memtable: bool,
+    ) -> Result<BatchWriterFlushResult, SlateDBError> {
         let (done, rx) = oneshot::channel();
         self.write_notifier
             .send(BatchWriterMessage::Flush(BatchWriterFlush {
                 freeze_memtable,
                 done,
             }))?;
-        let (flush_result, checkpoint_boundary) = rx.await??;
-        flush_result.await?;
-        Ok(checkpoint_boundary)
+        rx.await?
     }
 
     /// RFC-0024 route-consistency check. Verifies that `batch_prefixes`,

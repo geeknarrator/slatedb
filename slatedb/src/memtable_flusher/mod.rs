@@ -130,12 +130,14 @@ impl MemtableFlusher {
         id: Uuid,
         boundary: CheckpointBoundary,
         options: CheckpointOptions,
+        wal_flush: Option<crate::wal::FlushResultFuture>,
     ) -> Result<CheckpointHandle, SlateDBError> {
         let (lifecycle, result_rx, ready_rx) = CheckpointLifecycle::new();
         let request = CheckpointRequest {
             id,
             boundary,
             lifecycle,
+            wal_flush,
         };
         self.messages_tx
             .send(TrackerMessage::CheckpointRequest { options, request })?;
@@ -151,7 +153,7 @@ impl MemtableFlusher {
         boundary: CheckpointBoundary,
         options: CheckpointOptions,
     ) -> Result<crate::checkpoint::CheckpointCreateResult, SlateDBError> {
-        self.begin_checkpoint(Uuid::new_v4(), boundary, options)
+        self.begin_checkpoint(Uuid::new_v4(), boundary, options, None)
             .await?
             .wait_inner()
             .await

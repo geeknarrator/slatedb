@@ -2,6 +2,7 @@ use crate::config::{CheckpointOptions, CheckpointScope};
 use crate::db::Db;
 use crate::error::SlateDBError;
 use crate::utils::IdGenerator;
+use crate::wal::FlushResultFuture;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use tokio::sync::oneshot;
@@ -38,6 +39,7 @@ pub(crate) struct CheckpointRequest {
     pub(crate) id: Uuid,
     pub(crate) boundary: CheckpointBoundary,
     pub(crate) lifecycle: CheckpointLifecycle,
+    pub(crate) wal_flush: Option<FlushResultFuture>,
 }
 
 pub(crate) struct CheckpointLifecycle {
@@ -123,8 +125,10 @@ impl Db {
     /// Captures the checkpoint boundary and starts the durable storage work.
     ///
     /// [`CheckpointScope::All`] freezes the active memtable, the in-memory write buffer, before this method returns.
+    /// Concurrent writes before this method returns can be included.
     /// Writes issued after this method returns are excluded from that checkpoint.
     /// Call [`CheckpointHandle::wait`] to wait for the checkpoint manifest.
+    /// WAL upload completion and its errors are reported through that handle.
     ///
     /// The database owns the request once it enters the flush pipeline.
     /// Dropping this future or the handle does not cancel an accepted request.
@@ -141,17 +145,19 @@ impl Db {
         scope: CheckpointScope,
         options: &CheckpointOptions,
     ) -> Result<CheckpointHandle, crate::Error> {
-        let boundary = match scope {
-            CheckpointScope::All => self
-                .inner
-                .request_batch_writer_flush(true)
-                .await?
-                .expect("a memtable freeze must return a checkpoint boundary"),
+        let (boundary, wal_flush) = match scope {
+            CheckpointScope::All => {
+                let (wal_flush, boundary) = self.inner.begin_batch_writer_flush(true).await?;
+                (
+                    boundary.expect("a memtable freeze must return a checkpoint boundary"),
+                    Some(wal_flush),
+                )
+            }
             CheckpointScope::Durable => {
                 let guard = self.inner.state.read();
                 let state = guard.state();
                 let core = state.core();
-                CheckpointBoundary {
+                let boundary = CheckpointBoundary {
                     through_seq: None,
                     wal_id_last_seen: if self.inner.wal_enabled {
                         Some(
@@ -162,14 +168,15 @@ impl Db {
                     } else {
                         None
                     },
-                }
+                };
+                (boundary, None)
             }
         };
         let id = self.inner.rand.rng().gen_uuid();
 
         self.inner
             .memtable_flusher()
-            .begin_checkpoint(id, boundary, options.clone())
+            .begin_checkpoint(id, boundary, options.clone(), wal_flush)
             .await
             .map_err(Into::into)
     }
@@ -197,6 +204,7 @@ mod tests {
         Settings,
     };
     use crate::db::Db;
+    use crate::db_reader::{DbReader, DbReaderMode};
     use crate::db_state::{SsTableId, SsTableView};
     use crate::format::sst::SsTableFormat;
     use crate::iter::RowEntryIterator;
@@ -605,6 +613,124 @@ mod tests {
         )
         .await;
 
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_begin_checkpoint_returns_before_wal_upload() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_begin_checkpoint_returns_before_wal_upload");
+        let fp_registry = Arc::new(FailPointRegistry::new());
+        let db = Db::builder(path.clone(), object_store.clone())
+            .with_settings(Settings {
+                flush_interval: None,
+                ..Settings::default()
+            })
+            .with_fp_registry(fp_registry.clone())
+            .build()
+            .await
+            .unwrap();
+        fail_parallel::cfg(fp_registry.clone(), "write-wal-sst-io-error", "pause").unwrap();
+        db.put(b"before", b"v1").await.unwrap();
+        let started = tokio::time::timeout(
+            Duration::from_secs(5),
+            db.begin_checkpoint(CheckpointScope::All, &CheckpointOptions::default()),
+        )
+        .await;
+        let handle = match started {
+            Ok(Ok(handle)) => handle,
+            _ => {
+                fail_parallel::remove(fp_registry, "write-wal-sst-io-error");
+                panic!("checkpoint creation did not return while the WAL upload was paused");
+            }
+        };
+        let mut completion = Box::pin(handle.wait());
+        let completion_pending = futures::poll!(&mut completion).is_pending();
+        let flush_pending = tokio::time::timeout(Duration::from_millis(50), db.flush())
+            .await
+            .is_err();
+        fail_parallel::remove(fp_registry, "write-wal-sst-io-error");
+        assert!(completion_pending);
+        assert!(flush_pending);
+
+        db.put(b"after", b"v2").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        let checkpoint = completion.await.unwrap();
+        let reader = DbReader::builder(path, object_store)
+            .with_reader_mode(DbReaderMode::Checkpoint(checkpoint.id))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.get(b"before").await.unwrap(),
+            Some(Bytes::from_static(b"v1"))
+        );
+        assert_eq!(reader.get(b"after").await.unwrap(), None);
+        reader.close().await.unwrap();
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_delayed_checkpoint_survives_concurrent_table_flushes() {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let path = Path::from("/tmp/test_delayed_checkpoint_survives_concurrent_table_flushes");
+        let db = Db::builder(path.clone(), object_store.clone())
+            .with_settings(Settings {
+                flush_interval: Some(Duration::from_secs(3600)),
+                ..Settings::default()
+            })
+            .build()
+            .await
+            .unwrap();
+        db.put(b"before", b"v1").await.unwrap();
+        let options = CheckpointOptions::default();
+        let mut checkpoint = Box::pin(db.begin_checkpoint(CheckpointScope::All, &options));
+        assert!(futures::poll!(&mut checkpoint).is_pending());
+
+        // Finish the requested freeze before advancing the table state again.
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        db.put(b"during", b"v2").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+
+        let handle = checkpoint.await.unwrap();
+        db.put(b"after", b"v3").await.unwrap();
+        db.flush_with_options(FlushOptions {
+            flush_type: FlushType::MemTable,
+        })
+        .await
+        .unwrap();
+        let result = handle.wait().await.unwrap();
+        let reader = DbReader::builder(path, object_store)
+            .with_reader_mode(DbReaderMode::Checkpoint(result.id))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.get(b"before").await.unwrap(),
+            Some(Bytes::from_static(b"v1"))
+        );
+        assert_eq!(
+            reader.get(b"during").await.unwrap(),
+            Some(Bytes::from_static(b"v2"))
+        );
+        assert_eq!(reader.get(b"after").await.unwrap(), None);
+        assert_eq!(
+            db.get(b"after").await.unwrap(),
+            Some(Bytes::from_static(b"v3"))
+        );
+        reader.close().await.unwrap();
         db.close().await.unwrap();
     }
 
