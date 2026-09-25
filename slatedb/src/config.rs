@@ -1472,15 +1472,25 @@ pub struct SizeTieredCompactionSchedulerOptions {
     /// size is less than this value times the min size of the runs currently included in C.
     pub include_size_threshold: f32,
 
-    /// The sorted-run count that enables fallback consolidation for each tree.
+    /// The projected sorted-run count above which fallback consolidation starts for each tree.
     /// Zero disables the trigger. This value does not impose a hard limit.
+    /// The scheduler rejects one with a warning and disables the fallback.
+    /// Enabled values must be at least two.
+    ///
+    /// The projected count includes active compactions and newly selected work.
+    /// The fallback limits its sources to reach this count without going below it.
+    /// Normal size-based scheduling can reduce the count further.
+    ///
+    /// A threshold of two can cause frequent fallback merges as new runs arrive.
+    /// Repeatedly merging new data with a growing run increases storage reads and writes
+    /// and consumes compaction capacity. Other low thresholds can have the same cost.
     ///
     /// When normal scheduling finds no work, the fallback ignores `min_compaction_sources`
     /// and `include_size_threshold`. It requires at least two sources and respects
     /// `max_compaction_sources`, source conflicts, and existing limits on compaction work.
     ///
-    /// The fallback tries consecutive groups from newest to oldest. If a group exceeds
-    /// `max_compaction_sources`, it retains the oldest sources in that group.
+    /// The fallback tries consecutive groups from newest to oldest. It stops each group
+    /// at `max_compaction_sources` and keeps the newest eligible sources in that group.
     pub sorted_run_consolidation_threshold: usize,
 }
 
