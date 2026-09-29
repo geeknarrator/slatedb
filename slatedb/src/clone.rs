@@ -203,6 +203,9 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                     }
                 };
                 manifest.core.initialized = false;
+                if std::env::var("SLATEDB_CLONE_IMPORT").map(|v| v == "1").unwrap_or(false) {
+                    import_external_ssts(&mut manifest, &clone_path, &object_store).await?;
+                }
 
                 (
                     StoredManifest::store_uninitialized_clone(
@@ -262,6 +265,38 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
         clone_manifest,
         copy_wal_params,
     })
+}
+
+async fn import_external_ssts(
+    manifest: &mut Manifest,
+    clone_path: &Path,
+    object_store: &Arc<dyn ObjectStore>,
+) -> Result<(), SlateDBError> {
+    use futures::StreamExt;
+    use object_store::ObjectStoreExt;
+    let parallelism: usize = std::env::var("SLATEDB_CLONE_IMPORT_PARALLELISM")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32);
+    let external = manifest.external_ssts();
+    let ids: Vec<crate::db_state::SsTableId> = external.keys().cloned().collect();
+    let src = crate::paths::PathResolver::new_with_external_ssts(clone_path.clone(), external);
+    let dst = crate::paths::PathResolver::from_root(clone_path.clone());
+    let results: Vec<Result<(), SlateDBError>> = futures::stream::iter(ids)
+        .map(|id| {
+            let from = src.sst_path(&id);
+            let to = dst.sst_path(&id);
+            let os = object_store.clone();
+            async move { os.copy(&from, &to).await.map_err(SlateDBError::from) }
+        })
+        .buffer_unordered(parallelism)
+        .collect()
+        .await;
+    for r in results {
+        r?;
+    }
+    manifest.external_dbs.clear();
+    Ok(())
 }
 
 fn to_byte_range<T: RangeBounds<Bytes> + Clone>(bounds: &T) -> BytesRange {
