@@ -2087,6 +2087,7 @@ pub struct CloneBuilder<R: RangeBounds<Bytes> + Clone = (Bound<Bytes>, Bound<Byt
     projection_range: Option<R>,
     segment_filter: Option<SegmentFilterFn>,
     segment_projection: Option<SegmentProjectionFn>,
+    import_external_ssts: bool,
 }
 
 impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
@@ -2106,7 +2107,13 @@ impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
             projection_range: None,
             segment_filter: None,
             segment_projection: None,
+            import_external_ssts: false,
         }
+    }
+
+    pub fn with_import_external_ssts(mut self, import_external_ssts: bool) -> Self {
+        self.import_external_ssts = import_external_ssts;
+        self
     }
 
     pub fn with_clone_path(mut self, clone_path: Path) -> Self {
@@ -2197,7 +2204,7 @@ impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
                 fp_registry.clone(),
             ))
         };
-        crate::clone::create_clone(
+        crate::clone::create_clone_with_options(
             self.sources,
             self.clone_path,
             self.object_store,
@@ -2209,6 +2216,7 @@ impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
             self.projection_range,
             self.segment_filter,
             self.segment_projection,
+            self.import_external_ssts,
         )
         .await
         .map_err(crate::Error::from)

@@ -43,6 +43,7 @@ struct CreateCloneManifestResult {
     copy_wal_params: Option<CopyWalParams>,
 }
 
+#[cfg(test)]
 pub(crate) async fn create_clone<P: Into<Path>, R: RangeBounds<Bytes> + Clone>(
     clone_sources: Vec<CloneSourceSpec<R>>,
     clone_path: P,
@@ -54,6 +55,36 @@ pub(crate) async fn create_clone<P: Into<Path>, R: RangeBounds<Bytes> + Clone>(
     projection_range: Option<R>,
     segment_filter: Option<SegmentFilterFn>,
     segment_projection: Option<SegmentProjectionFn>,
+) -> Result<(), SlateDBError> {
+    create_clone_with_options(
+        clone_sources,
+        clone_path,
+        object_store,
+        wal_admin,
+        fp_registry,
+        system_clock,
+        rand,
+        projection_range,
+        segment_filter,
+        segment_projection,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_clone_with_options<P: Into<Path>, R: RangeBounds<Bytes> + Clone>(
+    clone_sources: Vec<CloneSourceSpec<R>>,
+    clone_path: P,
+    object_store: Arc<dyn ObjectStore>,
+    wal_admin: Arc<dyn WalAdmin>,
+    fp_registry: Arc<FailPointRegistry>,
+    system_clock: Arc<dyn SystemClock>,
+    rand: Arc<DbRand>,
+    projection_range: Option<R>,
+    segment_filter: Option<SegmentFilterFn>,
+    segment_projection: Option<SegmentProjectionFn>,
+    import_external_ssts: bool,
 ) -> Result<(), SlateDBError> {
     let clone_path = clone_path.into();
 
@@ -73,6 +104,7 @@ pub(crate) async fn create_clone<P: Into<Path>, R: RangeBounds<Bytes> + Clone>(
         segment_filter,
         segment_projection,
         wal_admin.as_ref(),
+        import_external_ssts,
     )
     .await?;
 
@@ -106,6 +138,7 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
     segment_filter: Option<SegmentFilterFn>,
     segment_projection: Option<SegmentProjectionFn>,
     wal_admin: &dyn WalAdmin,
+    import_external_ssts: bool,
 ) -> Result<CreateCloneManifestResult, SlateDBError> {
     let clone_manifest_store = Arc::new(ManifestStore::new(&clone_path, object_store.clone()));
 
@@ -114,6 +147,13 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
             Some(initialized_clone_manifest)
                 if initialized_clone_manifest.db_state().initialized =>
             {
+                if import_external_ssts && initialized_clone_manifest.manifest().external_dbs.is_empty()
+                {
+                    return Ok(CreateCloneManifestResult {
+                        clone_manifest: initialized_clone_manifest,
+                        copy_wal_params: None,
+                    });
+                }
                 for source_spec in &source_specs {
                     validate_attached_to_external_db(
                         source_spec.path.to_string(),
@@ -132,6 +172,30 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                     clone_manifest: initialized_clone_manifest,
                     copy_wal_params: None,
                 });
+            }
+            Some(uninitialized_clone_manifest)
+                if import_external_ssts
+                    && uninitialized_clone_manifest.manifest().external_dbs.is_empty() =>
+            {
+                let copy_wal_params = match &source_specs[..] {
+                    [_] => {
+                        let sources = build_sources(
+                            &source_specs,
+                            &object_store,
+                            &system_clock,
+                            &rand,
+                            &projection_range,
+                            segment_filter.as_ref(),
+                            segment_projection.as_ref(),
+                        )
+                        .await?;
+                        sources
+                            .first()
+                            .map(|source| copy_wal_params_for_source(source, &clone_path))
+                    }
+                    _ => None,
+                };
+                (uninitialized_clone_manifest, copy_wal_params)
             }
             Some(uninitialized_clone_manifest) => {
                 for source_spec in &source_specs {
@@ -203,8 +267,9 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                     }
                 };
                 manifest.core.initialized = false;
-                if std::env::var("SLATEDB_CLONE_IMPORT").map(|v| v == "1").unwrap_or(false) {
-                    import_external_ssts(&mut manifest, &clone_path, &object_store).await?;
+                if import_external_ssts {
+                    import_external_ssts_into_clone(&mut manifest, &clone_path, &object_store)
+                        .await?;
                 }
 
                 (
@@ -267,17 +332,16 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
     })
 }
 
-async fn import_external_ssts(
+const IMPORT_EXTERNAL_SSTS_PARALLELISM: usize = 32;
+
+async fn import_external_ssts_into_clone(
     manifest: &mut Manifest,
     clone_path: &Path,
     object_store: &Arc<dyn ObjectStore>,
 ) -> Result<(), SlateDBError> {
     use futures::StreamExt;
     use object_store::ObjectStoreExt;
-    let parallelism: usize = std::env::var("SLATEDB_CLONE_IMPORT_PARALLELISM")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(32);
+    let parallelism = IMPORT_EXTERNAL_SSTS_PARALLELISM;
     let external = manifest.external_ssts();
     let ids: Vec<crate::db_state::SsTableId> = external.keys().cloned().collect();
     let src = crate::paths::PathResolver::new_with_external_ssts(clone_path.clone(), external);
