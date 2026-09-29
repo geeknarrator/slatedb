@@ -132,6 +132,7 @@ pub fn build_settings_compactor(rng: &mut impl Rng) -> CompactorOptions {
             max_compaction_sources,
             include_size_threshold: rng.random_range(2.0..=8.0),
             sorted_run_consolidation_threshold: 0,
+            external_db_compaction_threshold: None,
         }
         .into(),
         worker: Some(CompactionWorkerOptions {

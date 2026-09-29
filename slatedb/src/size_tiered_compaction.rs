@@ -7,6 +7,7 @@ use crate::compactor::{CompactionScheduler, CompactionSchedulerSupplier};
 use crate::compactor_state::{Compaction, CompactionSpec, SourceId};
 use crate::compactor_state_protocols::CompactorStateView;
 use crate::config::{CompactorOptions, SizeTieredCompactionSchedulerOptions};
+use crate::db_state::SsTableId;
 use crate::error::Error;
 use crate::manifest::{LsmTreeState, ManifestCore};
 use log::warn;
@@ -269,6 +270,24 @@ impl CompactionScheduler for SizeTieredCompactionScheduler {
             .collect();
         trees.sort_by_key(|t| std::cmp::Reverse(t.l0.len()));
 
+        // Reserve one available slot for dependency reduction before normal work.
+        if compaction_slots_in_use < self.max_concurrent_compactions {
+            if let Some(compaction) = self.pick_external_db_compaction(
+                state,
+                &trees,
+                &active_compactions,
+                &mut next_fresh_sr_id,
+            ) {
+                let tree = trees
+                    .iter_mut()
+                    .find(|tree| tree.prefix == compaction.segment())
+                    .expect("the selected tree must exist");
+                tree.conflicts.add_compaction(&compaction);
+                tree.project_compaction(&compaction);
+                compactions.push(compaction);
+            }
+        }
+
         // Round-robin: one pick per tree per pass, looping until either the
         // budget is exhausted or no tree produced a spec on the last pass.
         // This guarantees every tree gets a chance before any one tree gets
@@ -292,6 +311,34 @@ impl CompactionScheduler for SizeTieredCompactionScheduler {
         }
 
         compactions
+    }
+
+    fn requires_rewrite(&self, state: &CompactorStateView, spec: &CompactionSpec) -> bool {
+        if self.options.external_db_compaction_threshold.is_none() || spec.is_drain() {
+            return false;
+        }
+        let borrowed: HashSet<_> = state
+            .manifest()
+            .external_dbs()
+            .iter()
+            .flat_map(|db| db.sst_ids.iter().copied())
+            .collect();
+        let Some(tree) = state.manifest().core().tree_for_segment(spec.segment()) else {
+            return false;
+        };
+        spec.sources().iter().any(|source| match source {
+            SourceId::SstView(id) => tree
+                .l0
+                .iter()
+                .any(|view| view.id == *id && borrowed.contains(&view.sst.id)),
+            SourceId::SortedRun(id) => tree.compacted.iter().any(|run| {
+                run.id == *id
+                    && run
+                        .sst_views()
+                        .iter()
+                        .any(|view| borrowed.contains(&view.sst.id))
+            }),
+        })
     }
 
     fn validate(
@@ -360,6 +407,116 @@ impl CompactionScheduler for SizeTieredCompactionScheduler {
 }
 
 impl SizeTieredCompactionScheduler {
+    fn pick_external_db_compaction(
+        &self,
+        state: &CompactorStateView,
+        trees: &[TreeState],
+        active: &[&Compaction],
+        next_fresh_sr_id: &mut u32,
+    ) -> Option<CompactionSpec> {
+        let threshold = self.options.external_db_compaction_threshold?;
+        let limit = self.options.max_compaction_sources;
+        if limit == 0 {
+            return None;
+        }
+
+        // Every view of a physical file must disappear before its dependency ends.
+        let mut sources_by_sst: HashMap<SsTableId, HashSet<SourceId>> = HashMap::new();
+        for tree in state.manifest().core().trees() {
+            for view in &tree.l0 {
+                sources_by_sst
+                    .entry(view.sst.id)
+                    .or_default()
+                    .insert(SourceId::SstView(view.id));
+            }
+            for run in &tree.compacted {
+                for view in run.sst_views() {
+                    sources_by_sst
+                        .entry(view.sst.id)
+                        .or_default()
+                        .insert(SourceId::SortedRun(run.id));
+                }
+            }
+        }
+        let pending: HashSet<_> = active
+            .iter()
+            .flat_map(|job| job.spec().sources().iter().copied())
+            .collect();
+        let mut dependencies: Vec<HashSet<SourceId>> = state
+            .manifest()
+            .external_dbs()
+            .iter()
+            .map(|db| {
+                db.sst_ids
+                    .iter()
+                    .filter_map(|id| sources_by_sst.get(id))
+                    .flatten()
+                    .filter(|source| !pending.contains(source))
+                    .copied()
+                    .collect()
+            })
+            .filter(|sources: &HashSet<SourceId>| !sources.is_empty())
+            .collect();
+        if dependencies.len() <= threshold {
+            return None;
+        }
+
+        // Include older L0 files in the cost because the watermark requires a suffix.
+        for sources in &mut dependencies {
+            for tree in trees {
+                if let Some(first) = tree.l0.iter().position(|src| sources.contains(&src.source)) {
+                    sources.extend(
+                        tree.l0[first..]
+                            .iter()
+                            .map(|src| src.source)
+                            .filter(|source| !pending.contains(source)),
+                    );
+                }
+            }
+        }
+        let sizes: HashMap<_, _> = trees
+            .iter()
+            .flat_map(|tree| tree.l0.iter().chain(&tree.srs))
+            .map(|src| (src.source, src.size))
+            .collect();
+        dependencies.sort_by_cached_key(|sources| {
+            sources
+                .iter()
+                .fold(0u64, |bytes, source| bytes.saturating_add(sizes[source]))
+        });
+
+        for sources in dependencies {
+            for tree in trees {
+                // Serialize L0 work within each tree, including jobs awaiting commit.
+                let l0_busy = active
+                    .iter()
+                    .any(|job| job.spec().segment() == &tree.prefix && job.spec().has_l0_sources());
+                if !l0_busy {
+                    if let Some(first) =
+                        tree.l0.iter().position(|src| sources.contains(&src.source))
+                    {
+                        let start = first.max(tree.l0.len().saturating_sub(limit));
+                        let candidates = tree.l0[start..].iter().copied().collect();
+                        let dst = *next_fresh_sr_id;
+                        if tree.conflicts.check_compaction(&candidates, dst) {
+                            *next_fresh_sr_id = next_fresh_sr_id.checked_add(1)?;
+                            return Some(self.create_compaction(&tree.prefix, candidates, dst));
+                        }
+                    }
+                }
+                // A single run can hold the last borrowed file, regardless of its size.
+                for src in &tree.srs {
+                    if sources.contains(&src.source) && tree.conflicts.check_source(src.source) {
+                        return Some(
+                            self.create_sorted_run_compaction(&tree.prefix, VecDeque::from([*src])),
+                        );
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub(crate) fn new(
         mut options: SizeTieredCompactionSchedulerOptions,
         max_concurrent_compactions: usize,
@@ -606,7 +763,7 @@ mod tests {
     use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableInfo, SsTableView};
     use crate::format::sst::SST_FORMAT_VERSION_LATEST;
     use crate::manifest::store::test_utils::new_dirty_manifest;
-    use crate::manifest::{LsmTreeState, ManifestCore, Segment};
+    use crate::manifest::{ExternalDb, LsmTreeState, ManifestCore, Segment};
     use crate::seq_tracker::SequenceTracker;
     use crate::size_tiered_compaction::CompactionSource;
     use crate::size_tiered_compaction::{
@@ -619,6 +776,223 @@ mod tests {
     use slatedb_txn_obj::test_utils::new_dirty_object;
     use std::ops::Bound::{Excluded, Included};
     use std::sync::Arc;
+
+    fn with_external_entries(
+        mut state: CompactorState,
+        entries: Vec<Vec<SsTableId>>,
+    ) -> CompactorState {
+        state.manifest_mut_for_test().value.external_dbs = entries
+            .into_iter()
+            .map(|sst_ids| ExternalDb {
+                path: "parent".to_string(),
+                source_checkpoint_id: uuid::Uuid::new_v4(),
+                final_checkpoint_id: Some(uuid::Uuid::new_v4()),
+                sst_ids,
+            })
+            .collect();
+        state
+    }
+
+    fn external_scheduler(threshold: Option<usize>, slots: usize) -> SizeTieredCompactionScheduler {
+        SizeTieredCompactionScheduler::new(
+            SizeTieredCompactionSchedulerOptions {
+                external_db_compaction_threshold: threshold,
+                ..Default::default()
+            },
+            slots,
+        )
+    }
+
+    #[rstest::rstest]
+    #[case::disabled(None, false)]
+    #[case::rewrite_all(Some(0), true)]
+    #[case::at_target(Some(1), false)]
+    fn test_external_compaction_threshold(
+        #[case] threshold: Option<usize>,
+        #[case] expected: bool,
+    ) {
+        let run = create_sr2(0, 1024);
+        let ids = run.sst_views().iter().map(|v| v.sst.id).collect();
+        let state = with_external_entries(
+            create_compactor_state(create_db_state(VecDeque::new(), vec![run])),
+            vec![ids, vec![]],
+        );
+        let scheduler = external_scheduler(threshold, 1);
+        let specs = scheduler.propose(&(&state).into());
+        assert_eq!(
+            specs,
+            if expected {
+                vec![create_sr_compaction(vec![0])]
+            } else {
+                vec![]
+            }
+        );
+        for spec in specs {
+            scheduler.validate(&(&state).into(), &spec).unwrap();
+            assert!(scheduler.requires_rewrite(&(&state).into(), &spec));
+        }
+    }
+
+    #[test]
+    fn test_external_compaction_prefers_complete_dependency_cost() {
+        let runs = vec![create_sr2(2, 2), create_sr2(1, 1024), create_sr2(0, 64)];
+        let ids: Vec<_> = runs.iter().map(|run| run.sst_views()[0].sst.id).collect();
+        let state = with_external_entries(
+            create_compactor_state(create_db_state(VecDeque::new(), runs)),
+            vec![vec![ids[0], ids[1]], vec![ids[2]]],
+        );
+        assert_eq!(
+            external_scheduler(Some(1), 1).propose(&(&state).into()),
+            vec![create_sr_compaction(vec![0])]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::no_sources(0)]
+    #[case::one_source(1)]
+    #[case::two_sources(2)]
+    #[case::all_sources(8)]
+    fn test_external_compaction_consumes_oldest_l0_suffix(#[case] limit: usize) {
+        let l0 = [
+            create_sst_view(10),
+            create_sst_view(10),
+            create_sst_view(10),
+        ];
+        let state = with_external_entries(
+            create_compactor_state(create_db_state(l0.iter().cloned().collect(), vec![])),
+            vec![vec![l0[0].sst.id]],
+        );
+        let scheduler = SizeTieredCompactionScheduler::new(
+            SizeTieredCompactionSchedulerOptions {
+                external_db_compaction_threshold: Some(0),
+                max_compaction_sources: limit,
+                ..Default::default()
+            },
+            1,
+        );
+        let expected = if limit == 0 {
+            vec![]
+        } else {
+            vec![create_l0_compaction(
+                &l0[l0.len().saturating_sub(limit)..],
+                0,
+            )]
+        };
+        assert_eq!(scheduler.propose(&(&state).into()), expected);
+        for spec in expected {
+            scheduler.validate(&(&state).into(), &spec).unwrap();
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::submitted(CompactionStatus::Submitted)]
+    #[case::running(CompactionStatus::Running)]
+    #[case::awaiting_commit(CompactionStatus::Compacted)]
+    fn test_external_compaction_credits_active_jobs(#[case] status: CompactionStatus) {
+        let runs = vec![create_sr2(1, 2), create_sr2(0, 1024)];
+        let entries = runs.iter().map(|r| vec![r.sst_views()[0].sst.id]).collect();
+        let mut state = with_external_entries(
+            create_compactor_state(create_db_state(VecDeque::new(), runs)),
+            entries,
+        );
+        state.insert_compaction_for_test(
+            Compaction::new(ulid::Ulid::new(), create_sr_compaction(vec![1])).with_status(status),
+        );
+        assert!(external_scheduler(Some(1), 4)
+            .propose(&(&state).into())
+            .is_empty());
+    }
+
+    #[test]
+    fn test_external_compaction_counts_all_views_across_segments() {
+        let shared = create_sst_view(10);
+        let mut core = create_db_state(VecDeque::new(), vec![SortedRun::new(1, [shared.clone()])]);
+        core.segments = vec![segment_with(
+            b"seg/",
+            VecDeque::new(),
+            vec![SortedRun::new(0, [shared.clone()])],
+        )];
+        let mut state =
+            with_external_entries(create_compactor_state(core), vec![vec![shared.sst.id]]);
+        state.insert_compaction_for_test(Compaction::new(
+            ulid::Ulid::new(),
+            create_sr_compaction(vec![1]),
+        ));
+        let scheduler = external_scheduler(Some(0), 2);
+        let expected = CompactionSpec::for_segment(
+            Bytes::from_static(b"seg/"),
+            vec![SourceId::SortedRun(0)],
+            0,
+        );
+        assert_eq!(scheduler.propose(&(&state).into()), vec![expected.clone()]);
+        scheduler.validate(&(&state).into(), &expected).unwrap();
+    }
+
+    #[test]
+    fn test_external_compaction_does_not_overlap_l0_work_awaiting_commit() {
+        let l0 = [create_sst_view(10), create_sst_view(10)];
+        let mut state = with_external_entries(
+            create_compactor_state(create_db_state(l0.iter().cloned().collect(), vec![])),
+            vec![vec![l0[0].sst.id]],
+        );
+        state.insert_compaction_for_test(
+            Compaction::new(ulid::Ulid::new(), create_l0_compaction(&l0[1..], 0))
+                .with_status(CompactionStatus::Compacted),
+        );
+        assert!(external_scheduler(Some(0), 4)
+            .propose(&(&state).into())
+            .is_empty());
+    }
+
+    #[test]
+    fn test_external_compaction_respects_slots_and_fills_remaining_slots_normally() {
+        let l0: Vec<_> = (0..4).map(|_| create_sst_view(10)).collect();
+        let run = create_sr2(9, 1024);
+        let borrowed = run.sst_views()[0].sst.id;
+        let state = with_external_entries(
+            create_compactor_state(create_db_state(l0.clone().into(), vec![run])),
+            vec![vec![borrowed]],
+        );
+        assert!(external_scheduler(Some(0), 0)
+            .propose(&(&state).into())
+            .is_empty());
+        assert_eq!(
+            external_scheduler(Some(0), 1).propose(&(&state).into()),
+            vec![create_sr_compaction(vec![9])]
+        );
+        assert_eq!(
+            external_scheduler(Some(0), 2).propose(&(&state).into()),
+            vec![create_sr_compaction(vec![9]), create_l0_compaction(&l0, 10)]
+        );
+    }
+
+    #[test]
+    fn test_external_compaction_allocates_global_destination() {
+        let l0 = [create_sst_view(10)];
+        let mut core = create_db_state(VecDeque::new(), vec![create_sr2(20, 1024)]);
+        core.segments = vec![segment_with(b"seg/", l0.to_vec().into(), vec![])];
+        let mut state =
+            with_external_entries(create_compactor_state(core), vec![vec![l0[0].sst.id]]);
+        state.insert_compaction_for_test(Compaction::new(
+            ulid::Ulid::new(),
+            CompactionSpec::new(vec![SourceId::SstView(ulid::Ulid::new())], 30),
+        ));
+        assert_eq!(
+            external_scheduler(Some(0), 2).propose(&(&state).into()),
+            vec![create_segment_l0_compaction(b"seg/", &l0, 31)]
+        );
+    }
+
+    #[test]
+    fn test_external_compaction_empty_entries_do_not_rewrite_owned_data() {
+        let state = with_external_entries(
+            create_compactor_state(create_db_state(VecDeque::new(), vec![create_sr2(0, 1024)])),
+            vec![vec![], vec![]],
+        );
+        let scheduler = external_scheduler(Some(0), 4);
+        assert!(scheduler.propose(&(&state).into()).is_empty());
+        assert!(!scheduler.requires_rewrite(&(&state).into(), &create_sr_compaction(vec![0])));
+    }
 
     #[test]
     fn test_should_compact_l0s_to_first_sr() {

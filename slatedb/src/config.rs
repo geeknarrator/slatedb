@@ -1492,6 +1492,21 @@ pub struct SizeTieredCompactionSchedulerOptions {
     /// The fallback tries consecutive groups from newest to oldest. It stops each group
     /// at `max_compaction_sources` and keeps the newest eligible sources in that group.
     pub sorted_run_consolidation_threshold: usize,
+
+    /// The target count of external entries that still reference current files.
+    /// `None` disables this policy. `Some(0)` targets all borrowed files.
+    /// This is a background target, not a hard limit on clone creation.
+    ///
+    /// Above the target, each scheduling pass prioritizes one dependency rewrite.
+    /// The policy prefers dependencies with a smaller estimated rewrite cost.
+    /// It can rewrite a single sorted run or an oldest suffix of L0 files.
+    /// It ignores the minimum source count, size ratio, and size-based backpressure.
+    /// Source conflicts, the maximum source count, and worker limits still apply.
+    /// Active jobs count toward the expected reduction in dependencies.
+    ///
+    /// Borrowed inputs use a worker even when trivial moves are enabled.
+    /// Retained checkpoints can keep empty external entries and parent pins alive.
+    pub external_db_compaction_threshold: Option<usize>,
 }
 
 impl Default for SizeTieredCompactionSchedulerOptions {
@@ -1501,6 +1516,7 @@ impl Default for SizeTieredCompactionSchedulerOptions {
             max_compaction_sources: 8,
             include_size_threshold: 4.0,
             sorted_run_consolidation_threshold: 0,
+            external_db_compaction_threshold: None,
         }
     }
 }
@@ -1546,6 +1562,15 @@ impl From<&HashMap<String, String>> for SizeTieredCompactionSchedulerOptions {
                         );
                     }
                 },
+                "external_db_compaction_threshold" => match value.parse::<usize>() {
+                    Ok(parsed) => options.external_db_compaction_threshold = Some(parsed),
+                    Err(err) => {
+                        warn!(
+                            "invalid scheduler option value for external_db_compaction_threshold: '{}': {}",
+                            value, err
+                        );
+                    }
+                },
                 _ => {
                     warn!("unknown scheduler option '{}'; ignoring", key);
                 }
@@ -1581,6 +1606,12 @@ impl From<SizeTieredCompactionSchedulerOptions> for HashMap<String, String> {
             "sorted_run_consolidation_threshold".to_string(),
             options.sorted_run_consolidation_threshold.to_string(),
         );
+        if let Some(threshold) = options.external_db_compaction_threshold {
+            map.insert(
+                "external_db_compaction_threshold".to_string(),
+                threshold.to_string(),
+            );
+        }
         map
     }
 }
@@ -2159,6 +2190,7 @@ object_store_cache_options:
             max_compaction_sources: 9,
             include_size_threshold: 7.0,
             sorted_run_consolidation_threshold: 5,
+            external_db_compaction_threshold: Some(12),
         };
 
         let map: HashMap<String, String> = options.into();
@@ -2168,6 +2200,55 @@ object_store_cache_options:
         assert_eq!(roundtripped.max_compaction_sources, 9);
         assert_eq!(roundtripped.include_size_threshold, 7.0);
         assert_eq!(roundtripped.sorted_run_consolidation_threshold, 5);
+        assert_eq!(roundtripped.external_db_compaction_threshold, Some(12));
+    }
+
+    #[test]
+    fn test_external_db_compaction_threshold_configuration() {
+        for threshold in [None, Some(0), Some(32)] {
+            let options = SizeTieredCompactionSchedulerOptions {
+                external_db_compaction_threshold: threshold,
+                ..Default::default()
+            };
+            let map: HashMap<String, String> = options.into();
+            assert_eq!(
+                map.contains_key("external_db_compaction_threshold"),
+                threshold.is_some()
+            );
+            assert_eq!(
+                SizeTieredCompactionSchedulerOptions::from(map).external_db_compaction_threshold,
+                threshold
+            );
+        }
+        for invalid in ["-1", "bad", ""] {
+            let map = HashMap::from([(
+                "external_db_compaction_threshold".to_string(),
+                invalid.to_string(),
+            )]);
+            assert_eq!(
+                SizeTieredCompactionSchedulerOptions::from(map).external_db_compaction_threshold,
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn test_external_db_compaction_threshold_from_toml() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "external.toml",
+                "[compactor_options.scheduler_options]\nexternal_db_compaction_threshold = \"0\"\n",
+            )?;
+            let settings = Settings::from_file("external.toml").unwrap();
+            let compactor = settings.compactor_options.unwrap();
+            assert!(compactor.worker.is_some());
+            assert_eq!(
+                SizeTieredCompactionSchedulerOptions::from(compactor.scheduler_options)
+                    .external_db_compaction_threshold,
+                Some(0)
+            );
+            Ok(())
+        });
     }
 
     #[test]
