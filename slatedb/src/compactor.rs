@@ -131,6 +131,13 @@ pub trait CompactionScheduler: Send + Sync {
     /// - A list of [`CompactionSpec`] describing what to compact and where to write.
     fn propose(&self, state: &CompactorStateView) -> Vec<CompactionSpec>;
 
+    /// Returns whether a job must rewrite its input files.
+    /// A trivial move changes metadata without rewriting files.
+    /// Return `true` when such a move cannot satisfy the policy.
+    fn requires_rewrite(&self, _state: &CompactorStateView, _spec: &CompactionSpec) -> bool {
+        false
+    }
+
     /// Validates a candidate compaction spec against scheduler-specific invariants. The
     /// default implementation accepts everything. Schedulers can override to enforce
     /// policy-specific constraints prior to execution (e.g. level rules, overlaps).
@@ -1221,11 +1228,12 @@ impl CompactorEventHandler {
 
             // Coordinator-local compactions never enter Scheduled because no
             // worker runs them. Everything else becomes ready to claim.
-            let trivial_move_output = self
-                .options
-                .enable_trivial_move
-                .then(|| compaction.trivial_move_output(self.state().db_state()))
-                .flatten();
+            let trivial_move_output = (self.options.enable_trivial_move
+                && !self
+                    .scheduler
+                    .requires_rewrite(&self.state().into(), compaction.spec()))
+            .then(|| compaction.trivial_move_output(self.state().db_state()))
+            .flatten();
 
             if compaction.spec().is_drain() {
                 self.state_mut().finish_drain_compaction(compaction.id());
@@ -1652,6 +1660,7 @@ mod tests {
             max_compaction_sources: 999,
             include_size_threshold: 4.0,
             max_sorted_runs: 0,
+            external_db_compaction_threshold: None,
         }
         .into();
         options
@@ -1988,6 +1997,7 @@ mod tests {
             max_compaction_sources: 999,
             include_size_threshold: 4.0,
             max_sorted_runs: 0,
+            external_db_compaction_threshold: None,
         }
         .into();
         let compactor_opts = options
@@ -2172,6 +2182,7 @@ mod tests {
             max_compaction_sources: 999,
             include_size_threshold: 4.0,
             max_sorted_runs: 0,
+            external_db_compaction_threshold: None,
         }
         .into();
         let compactor_opts = options
@@ -3543,6 +3554,7 @@ mod tests {
             max_compaction_sources: 2,
             include_size_threshold: 4.0,
             max_sorted_runs: 0,
+            external_db_compaction_threshold: None,
         }
         .into();
         let mut options = db_options(Some(compactor_options()));
@@ -3659,6 +3671,7 @@ mod tests {
             max_compaction_sources: 2,
             include_size_threshold: 4.0,
             max_sorted_runs: 0,
+            external_db_compaction_threshold: None,
         }
         .into();
         let mut options = db_options(Some(compactor_options()));
@@ -5642,6 +5655,7 @@ mod tests {
             max_compaction_sources: 999,
             include_size_threshold: 4.0,
             max_sorted_runs: 0,
+            external_db_compaction_threshold: None,
         }
         .into();
         let mut options = db_options(Some(compactor_options()));

@@ -1225,6 +1225,197 @@ mod tests {
         reader.close().await.unwrap();
     }
 
+    #[rstest::rstest]
+    #[case::borrowed_l0(false)]
+    #[case::borrowed_sorted_run(true)]
+    #[tokio::test]
+    async fn should_rewrite_external_files_and_preserve_checkpoint(#[case] compact_parent: bool) {
+        use crate::config::{CompactionWorkerOptions, CompactorOptions};
+        use object_store::ObjectStoreExt;
+        use std::collections::{HashMap, HashSet};
+
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let clock = Arc::new(DefaultSystemClock::new());
+        let settings = Settings {
+            compactor_options: None,
+            garbage_collector_options: None,
+            ..Default::default()
+        };
+        let compactor_options = CompactorOptions {
+            poll_interval: Duration::from_millis(10),
+            commit_compacted_interval: Duration::from_millis(10),
+            worker: Some(CompactionWorkerOptions {
+                compactions_poll_interval: Duration::from_millis(10),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let parent = Db::builder("parent", object_store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+        parent.put(b"a", b"old").await.unwrap();
+        parent.put(b"deleted", b"old").await.unwrap();
+        parent
+            .flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+        parent.put(b"a", b"new").await.unwrap();
+        parent.put(b"b", b"kept").await.unwrap();
+        parent.delete(b"deleted").await.unwrap();
+        parent
+            .flush_with_options(FlushOptions {
+                flush_type: FlushType::MemTable,
+            })
+            .await
+            .unwrap();
+        assert_eq!(parent.manifest().core().tree.l0.len(), 2);
+        parent.close().await.unwrap();
+
+        if compact_parent {
+            let parent = Db::builder("parent", object_store.clone())
+                .with_settings(Settings {
+                    compactor_options: Some(CompactorOptions {
+                        scheduler_options: HashMap::from([(
+                            "min_compaction_sources".into(),
+                            "2".into(),
+                        )]),
+                        ..compactor_options.clone()
+                    }),
+                    ..settings.clone()
+                })
+                .build()
+                .await
+                .unwrap();
+            let store = ManifestStore::new(&Path::from("parent"), object_store.clone());
+            tokio::time::timeout(Duration::from_secs(20), async {
+                while !store
+                    .read_latest_manifest()
+                    .await
+                    .unwrap()
+                    .core()
+                    .tree
+                    .l0
+                    .is_empty()
+                {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("parent compaction did not finish");
+            parent.close().await.unwrap();
+        }
+
+        create_clone(
+            Path::from("clone"),
+            Path::from("parent"),
+            object_store.clone(),
+            object_store.clone(),
+            None,
+            Arc::new(FailPointRegistry::new()),
+            clock.clone(),
+            Arc::new(DbRand::default()),
+        )
+        .await
+        .unwrap();
+        let store = Arc::new(ManifestStore::new(
+            &Path::from("clone"),
+            object_store.clone(),
+        ));
+        let mut stored = StoredManifest::load(store.clone(), clock).await.unwrap();
+        let borrowed: HashSet<_> = stored.manifest().external_ssts().into_keys().collect();
+        assert!(!borrowed.is_empty());
+        let checkpoint = Uuid::new_v4();
+        stored
+            .write_checkpoint(checkpoint, &CheckpointOptions::default())
+            .await
+            .unwrap();
+
+        let db = Db::builder("clone", object_store.clone())
+            .with_settings(Settings {
+                compactor_options: Some(CompactorOptions {
+                    enable_trivial_move: true,
+                    scheduler_options: HashMap::from([
+                        ("external_db_compaction_threshold".into(), "0".into()),
+                        ("max_compaction_sources".into(), "1".into()),
+                    ]),
+                    ..compactor_options
+                }),
+                ..settings.clone()
+            })
+            .build()
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(20), async {
+            while !store
+                .read_latest_manifest()
+                .await
+                .unwrap()
+                .external_ssts()
+                .is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("external compaction did not finish");
+        db.refresh_manifest().await.unwrap();
+        assert_eq!(
+            db.get(b"a").await.unwrap(),
+            Some(Bytes::from_static(b"new"))
+        );
+        assert_eq!(
+            db.get(b"b").await.unwrap(),
+            Some(Bytes::from_static(b"kept"))
+        );
+        assert_eq!(db.get(b"deleted").await.unwrap(), None);
+        let current = store.read_latest_manifest().await.unwrap();
+        assert_eq!(current.external_dbs().len(), 1);
+        let resolver = PathResolver::from_root("clone");
+        for view in current.core().all_sst_views() {
+            assert!(!borrowed.contains(&view.sst.id));
+            object_store
+                .head(&resolver.sst_path(&view.sst.id))
+                .await
+                .unwrap();
+        }
+        db.close().await.unwrap();
+
+        let reader = DbReader::builder("clone", object_store.clone())
+            .with_reader_mode(crate::DbReaderMode::Checkpoint(checkpoint))
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            reader.get(b"a").await.unwrap(),
+            Some(Bytes::from_static(b"new"))
+        );
+        assert_eq!(
+            reader.get(b"b").await.unwrap(),
+            Some(Bytes::from_static(b"kept"))
+        );
+        assert_eq!(reader.get(b"deleted").await.unwrap(), None);
+        reader.close().await.unwrap();
+        let reopened = Db::builder("clone", object_store)
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap();
+        assert_eq!(
+            reopened.get(b"a").await.unwrap(),
+            Some(Bytes::from_static(b"new"))
+        );
+        assert_eq!(
+            reopened.get(b"b").await.unwrap(),
+            Some(Bytes::from_static(b"kept"))
+        );
+        assert_eq!(reopened.get(b"deleted").await.unwrap(), None);
+        reopened.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn should_read_clone_with_db_reader_from_checkpoint_with_pruned_external_ssts() {
         let mut rng = rng::new_test_rng(None);

@@ -40,6 +40,94 @@ compaction I/O while still producing a sorted run of non-overlapping SSTs.
 Trivial moves are disabled by default. Set `CompactorOptions::enable_trivial_move` to `true`
 to enable them.
 
+## External database growth
+
+The size-tiered scheduler has an optional policy for reducing external database dependencies.
+An external dependency is an entry that references borrowed files.
+Above the configured target, each scheduling pass selects one dependency job before normal compaction work.
+The policy is disabled by default.
+
+To enable the policy through `Settings::from_file` or `Settings::load`, add this TOML configuration:
+
+```toml
+[compactor_options.scheduler_options]
+external_db_compaction_threshold = "32"
+```
+
+The value `32` is an example target, not a recommended production limit.
+The target counts entries with current file references, including separate entries for the same external path.
+It excludes empty entries that remain for checkpoint protection or cleanup.
+Omit the key to disable the policy, or set it to `"0"` to target all borrowed files.
+
+For applications that construct `Settings` directly, add the same entry to the scheduler map:
+
+```rust
+use slatedb::config::Settings;
+
+let mut settings = Settings::default();
+settings
+    .compactor_options
+    .as_mut()
+    .unwrap()
+    .scheduler_options
+    .insert("external_db_compaction_threshold".into(), "32".into());
+```
+
+Pass these settings to `Db::builder(...).with_settings(settings)`.
+For a standalone compactor, put the same entry in its `CompactorOptions::scheduler_options` map.
+The coordinator and a worker must run for the policy to make progress.
+
+### Selection and cost
+
+The policy prefers dependencies with a smaller estimated cost to rewrite their remaining files.
+It counts each required compaction source once per dependency, including every view of a shared physical file.
+A source is an L0 file view or a sorted run.
+A sorted run is an ordered group of files.
+The estimate uses visible bytes, so it does not guarantee a particular storage read cost.
+
+The policy can rewrite a single cold sorted run or a small group of L0 files.
+L0 contains the newest flushed files.
+Each L0 job consumes an oldest suffix to preserve the order that compaction requires.
+If a borrowed L0 file has older local files behind it, the policy also rewrites those older files.
+The cost estimate includes this required work.
+
+Dependency jobs ignore `min_compaction_sources`, `include_size_threshold`, and size-based backpressure.
+They respect `max_compaction_sources`, source conflicts, and `max_concurrent_compactions`.
+They use a fresh, globally unique destination for L0 output and preserve segment boundaries.
+Other available slots run normal compaction work.
+An active job counts toward the expected dependency reduction only through its selected sources.
+
+When this policy is enabled, jobs with borrowed inputs always rewrite files, even if `enable_trivial_move` is `true`.
+Jobs with only local inputs can still use trivial moves.
+This prevents repeated metadata moves from leaving the external dependency unchanged.
+
+A source-count limit does not bound the bytes in a job.
+One large sorted run can require substantial work, and dependency jobs compete with normal reads and writes.
+The scheduler selects at most one dependency job per pass, but successive passes can fill several worker slots.
+
+### Comparison with restore-time copying
+
+Compare the default policy with this policy under the same restore sequence and worker limits.
+Keep restore-time import disabled in both runs.
+Use `"0"` for an aggressive experiment, then test larger targets to measure the cost of retaining some dependencies.
+Use a separate run for restore-time import.
+
+Record these quantities for each run:
+
+- Active external entries immediately after restore and before the next recovery checkpoint.
+- Total external entries, retained checkpoints, and borrowed physical files.
+- Compaction bytes, storage requests, and peak retained storage.
+- Restore duration and normal read and write latency.
+
+The existing `external_db_count` metric includes empty entries.
+Use the manifest's `external_dbs` list to count entries with nonempty `sst_ids` separately.
+
+This policy sets a background target, not a hard limit on clone creation.
+Frequent restores can add dependencies faster than compaction removes them.
+Retained checkpoints can keep old files and parent pins alive after current files become local.
+Later recovery checkpoints must capture the compacted state to benefit.
+Restoring an older checkpoint still uses that checkpoint's original dependencies.
+
 To split data with different read/write profiles into independent LSM trees — each with its own
 compaction policy — and to retire whole key ranges cheaply, see
 [Segmented Compaction](/docs/design/segmented-compaction).
