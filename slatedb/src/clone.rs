@@ -2,7 +2,7 @@ use crate::bytes_range::BytesRange;
 use crate::checkpoint::Checkpoint;
 use crate::config::CheckpointOptions;
 
-use crate::db::builder::CloneSourceSpec;
+use crate::db::builder::{CloneImportMode, CloneImportOptions, CloneSourceSpec};
 use crate::error::SlateDBError;
 use crate::error::SlateDBError::CheckpointMissing;
 use crate::manifest::store::{ManifestStore, StoredManifest};
@@ -15,6 +15,7 @@ use object_store::path::Path;
 use object_store::ObjectStore;
 use slatedb_common::clock::SystemClock;
 use slatedb_common::DbRand;
+use std::collections::HashSet;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::Duration;
@@ -67,7 +68,7 @@ pub(crate) async fn create_clone<P: Into<Path>, R: RangeBounds<Bytes> + Clone>(
         projection_range,
         segment_filter,
         segment_projection,
-        false,
+        CloneImportOptions::default(),
     )
     .await
 }
@@ -84,7 +85,7 @@ pub(crate) async fn create_clone_with_options<P: Into<Path>, R: RangeBounds<Byte
     projection_range: Option<R>,
     segment_filter: Option<SegmentFilterFn>,
     segment_projection: Option<SegmentProjectionFn>,
-    import_external_ssts: bool,
+    import: CloneImportOptions,
 ) -> Result<(), SlateDBError> {
     let clone_path = clone_path.into();
 
@@ -104,7 +105,7 @@ pub(crate) async fn create_clone_with_options<P: Into<Path>, R: RangeBounds<Byte
         segment_filter,
         segment_projection,
         wal_admin.as_ref(),
-        import_external_ssts,
+        import,
     )
     .await?;
 
@@ -138,8 +139,9 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
     segment_filter: Option<SegmentFilterFn>,
     segment_projection: Option<SegmentProjectionFn>,
     wal_admin: &dyn WalAdmin,
-    import_external_ssts: bool,
+    import: CloneImportOptions,
 ) -> Result<CreateCloneManifestResult, SlateDBError> {
+    let import_full = import.mode == CloneImportMode::Full;
     let clone_manifest_store = Arc::new(ManifestStore::new(&clone_path, object_store.clone()));
 
     let (clone_manifest, copy_wal_params) =
@@ -147,7 +149,11 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
             Some(initialized_clone_manifest)
                 if initialized_clone_manifest.db_state().initialized =>
             {
-                if import_external_ssts && initialized_clone_manifest.manifest().external_dbs.is_empty()
+                if import_full
+                    && initialized_clone_manifest
+                        .manifest()
+                        .external_dbs
+                        .is_empty()
                 {
                     return Ok(CreateCloneManifestResult {
                         clone_manifest: initialized_clone_manifest,
@@ -174,8 +180,11 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                 });
             }
             Some(uninitialized_clone_manifest)
-                if import_external_ssts
-                    && uninitialized_clone_manifest.manifest().external_dbs.is_empty() =>
+                if import_full
+                    && uninitialized_clone_manifest
+                        .manifest()
+                        .external_dbs
+                        .is_empty() =>
             {
                 let copy_wal_params = match &source_specs[..] {
                     [_] => {
@@ -267,9 +276,17 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                     }
                 };
                 manifest.core.initialized = false;
-                if import_external_ssts {
-                    import_external_ssts_into_clone(&mut manifest, &clone_path, &object_store)
-                        .await?;
+                if import.mode != CloneImportMode::Off {
+                    let direct: HashSet<String> =
+                        source_specs.iter().map(|s| s.path.to_string()).collect();
+                    import_external_ssts_into_clone(
+                        &mut manifest,
+                        &clone_path,
+                        &object_store,
+                        import,
+                        &direct,
+                    )
+                    .await?;
                 }
 
                 (
@@ -332,17 +349,27 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
     })
 }
 
-const IMPORT_EXTERNAL_SSTS_PARALLELISM: usize = 32;
-
 async fn import_external_ssts_into_clone(
     manifest: &mut Manifest,
     clone_path: &Path,
     object_store: &Arc<dyn ObjectStore>,
+    import: CloneImportOptions,
+    direct: &HashSet<String>,
 ) -> Result<(), SlateDBError> {
     use futures::StreamExt;
     use object_store::ObjectStoreExt;
-    let parallelism = IMPORT_EXTERNAL_SSTS_PARALLELISM;
-    let external = manifest.external_ssts();
+    let mut external = manifest.external_ssts();
+    if let CloneImportMode::Inherited { min_inherited } = import.mode {
+        let inherited = manifest
+            .external_dbs
+            .iter()
+            .filter(|e| !direct.contains(&e.path) && !e.sst_ids.is_empty())
+            .count();
+        if inherited <= min_inherited {
+            return Ok(());
+        }
+        external.retain(|_, path| !direct.contains(&path.to_string()));
+    }
     let ids: Vec<crate::db_state::SsTableId> = external.keys().cloned().collect();
     let src = crate::paths::PathResolver::new_with_external_ssts(clone_path.clone(), external);
     let dst = crate::paths::PathResolver::from_root(clone_path.clone());
@@ -353,13 +380,18 @@ async fn import_external_ssts_into_clone(
             let os = object_store.clone();
             async move { os.copy(&from, &to).await.map_err(SlateDBError::from) }
         })
-        .buffer_unordered(parallelism)
+        .buffer_unordered(import.parallelism.max(1))
         .collect()
         .await;
     for r in results {
         r?;
     }
-    manifest.external_dbs.clear();
+    match import.mode {
+        CloneImportMode::Inherited { .. } => {
+            manifest.external_dbs.retain(|e| direct.contains(&e.path))
+        }
+        _ => manifest.external_dbs.clear(),
+    }
     Ok(())
 }
 
@@ -548,7 +580,7 @@ fn validate_clone_source_specs<R: RangeBounds<Bytes> + Clone>(
         return Err(SlateDBError::InvalidUnionSetEmpty());
     }
 
-    let mut seen_paths = std::collections::HashSet::new();
+    let mut seen_paths = HashSet::new();
     for source in specs {
         if clone_path == &source.path {
             return Err(SlateDBError::IdenticalClonePaths(clone_path.clone()));
@@ -3267,5 +3299,104 @@ mod tests {
             ),
             "expected NotFound for the missing WAL object, got {err:?}"
         );
+    }
+
+    async fn build_three_db_chain(object_store: Arc<dyn ObjectStore>, tag: &str) -> (Path, Path) {
+        let settings = Settings {
+            compactor_options: None,
+            ..Settings::default()
+        };
+        let parent_path = Path::from(format!("/tmp/{}_parent", tag));
+        let child_path = Path::from(format!("/tmp/{}_child", tag));
+        let parent = Db::builder(parent_path.clone(), object_store.clone())
+            .with_settings(settings.clone())
+            .build()
+            .await
+            .unwrap();
+        parent.put(b"parent_key", b"p").await.unwrap();
+        parent.flush().await.unwrap();
+        parent.close().await.unwrap();
+        crate::db::builder::CloneBuilder::new(
+            child_path.clone(),
+            CloneSourceSpec::new(parent_path.clone()),
+            object_store.clone(),
+        )
+        .build()
+        .await
+        .unwrap();
+        let child = Db::builder(child_path.clone(), object_store.clone())
+            .with_settings(settings)
+            .build()
+            .await
+            .unwrap();
+        child.put(b"child_key", b"c").await.unwrap();
+        child.flush().await.unwrap();
+        child.close().await.unwrap();
+        (parent_path, child_path)
+    }
+
+    async fn external_paths(path: &Path, object_store: Arc<dyn ObjectStore>) -> Vec<String> {
+        let store = Arc::new(ManifestStore::new(path, object_store));
+        let stored = StoredManifest::load(store, Arc::new(DefaultSystemClock::new()))
+            .await
+            .unwrap();
+        let mut paths: Vec<String> = stored
+            .manifest()
+            .external_dbs
+            .iter()
+            .map(|e| e.path.clone())
+            .collect();
+        paths.sort();
+        paths.dedup();
+        paths
+    }
+
+    async fn assert_chain_keys(path: &Path, object_store: Arc<dyn ObjectStore>) {
+        let db = Db::open(path.clone(), object_store).await.unwrap();
+        assert_eq!(
+            db.get(b"parent_key").await.unwrap(),
+            Some(Bytes::from_static(b"p"))
+        );
+        assert_eq!(
+            db.get(b"child_key").await.unwrap(),
+            Some(Bytes::from_static(b"c"))
+        );
+        db.close().await.unwrap();
+    }
+
+    #[rstest::rstest]
+    #[case::off(crate::CloneImportMode::Off, 2)]
+    #[case::full(crate::CloneImportMode::Full, 0)]
+    #[case::inherited(crate::CloneImportMode::Inherited { min_inherited: 0 }, 1)]
+    #[case::inherited_below_threshold(crate::CloneImportMode::Inherited { min_inherited: 1 }, 2)]
+    #[tokio::test]
+    async fn should_import_external_ssts_by_mode(
+        #[case] mode: crate::CloneImportMode,
+        #[case] expected_external_paths: usize,
+    ) {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let (parent_path, child_path) =
+            build_three_db_chain(object_store.clone(), "import_mode").await;
+        let grandchild_path = Path::from("/tmp/import_mode_grandchild");
+        crate::db::builder::CloneBuilder::new(
+            grandchild_path.clone(),
+            CloneSourceSpec::new(child_path.clone()),
+            object_store.clone(),
+        )
+        .with_import_options(crate::CloneImportOptions {
+            mode,
+            parallelism: 4,
+        })
+        .build()
+        .await
+        .unwrap();
+
+        let paths = external_paths(&grandchild_path, object_store.clone()).await;
+        assert_eq!(paths.len(), expected_external_paths, "{:?}", paths);
+        if expected_external_paths == 1 {
+            assert_eq!(paths, vec![child_path.to_string()]);
+            assert!(!paths.contains(&parent_path.to_string()));
+        }
+        assert_chain_keys(&grandchild_path, object_store).await;
     }
 }

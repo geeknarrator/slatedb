@@ -2075,6 +2075,28 @@ impl CloneSourceSpec<(Bound<Bytes>, Bound<Bytes>)> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloneImportMode {
+    Off,
+    Full,
+    Inherited { min_inherited: usize },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CloneImportOptions {
+    pub mode: CloneImportMode,
+    pub parallelism: usize,
+}
+
+impl Default for CloneImportOptions {
+    fn default() -> Self {
+        Self {
+            mode: CloneImportMode::Off,
+            parallelism: 32,
+        }
+    }
+}
+
 /// A builder for configuring database clone operations.
 pub struct CloneBuilder<R: RangeBounds<Bytes> + Clone = (Bound<Bytes>, Bound<Bytes>)> {
     clone_path: Path,
@@ -2087,7 +2109,7 @@ pub struct CloneBuilder<R: RangeBounds<Bytes> + Clone = (Bound<Bytes>, Bound<Byt
     projection_range: Option<R>,
     segment_filter: Option<SegmentFilterFn>,
     segment_projection: Option<SegmentProjectionFn>,
-    import_external_ssts: bool,
+    import: CloneImportOptions,
 }
 
 impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
@@ -2107,12 +2129,21 @@ impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
             projection_range: None,
             segment_filter: None,
             segment_projection: None,
-            import_external_ssts: false,
+            import: CloneImportOptions::default(),
         }
     }
 
     pub fn with_import_external_ssts(mut self, import_external_ssts: bool) -> Self {
-        self.import_external_ssts = import_external_ssts;
+        self.import.mode = if import_external_ssts {
+            CloneImportMode::Full
+        } else {
+            CloneImportMode::Off
+        };
+        self
+    }
+
+    pub fn with_import_options(mut self, import: CloneImportOptions) -> Self {
+        self.import = import;
         self
     }
 
@@ -2216,7 +2247,7 @@ impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
             self.projection_range,
             self.segment_filter,
             self.segment_projection,
-            self.import_external_ssts,
+            self.import,
         )
         .await
         .map_err(crate::Error::from)
