@@ -1683,6 +1683,7 @@ mod tests {
             max_compaction_sources: 999,
             include_size_threshold: 4.0,
             sorted_run_consolidation_threshold: 0,
+            max_size_amplification_ratio: None,
         }
         .into();
         options
@@ -2025,6 +2026,7 @@ mod tests {
             max_compaction_sources: 999,
             include_size_threshold: 4.0,
             sorted_run_consolidation_threshold: 0,
+            max_size_amplification_ratio: None,
         }
         .into();
         let compactor_opts = options
@@ -2209,6 +2211,7 @@ mod tests {
             max_compaction_sources: 999,
             include_size_threshold: 4.0,
             sorted_run_consolidation_threshold: 0,
+            max_size_amplification_ratio: None,
         }
         .into();
         let compactor_opts = options
@@ -3580,6 +3583,7 @@ mod tests {
             max_compaction_sources: 2,
             include_size_threshold: 4.0,
             sorted_run_consolidation_threshold: 0,
+            max_size_amplification_ratio: None,
         }
         .into();
         let mut options = db_options(Some(compactor_options()));
@@ -3696,6 +3700,7 @@ mod tests {
             max_compaction_sources: 2,
             include_size_threshold: 4.0,
             sorted_run_consolidation_threshold: 0,
+            max_size_amplification_ratio: None,
         }
         .into();
         let mut options = db_options(Some(compactor_options()));
@@ -5897,6 +5902,7 @@ mod tests {
             max_compaction_sources: 999,
             include_size_threshold: 4.0,
             sorted_run_consolidation_threshold: 0,
+            max_size_amplification_ratio: None,
         }
         .into();
         let mut options = db_options(Some(compactor_options()));

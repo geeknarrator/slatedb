@@ -174,6 +174,12 @@ impl TreeState {
     }
 }
 
+enum SizeAmplification {
+    NotTriggered,
+    Blocked,
+    Ready(VecDeque<CompactionSource>),
+}
+
 /// Implements a size-tiered compaction scheduler. The scheduler works by scheduling compaction for
 /// one of:
 /// - options.min_compaction_sources L0 SSTs
@@ -371,6 +377,16 @@ impl SizeTieredCompactionScheduler {
             );
             options.sorted_run_consolidation_threshold = 0;
         }
+        if let Some(ratio) = options.max_size_amplification_ratio {
+            if !ratio.is_finite() || ratio <= 0.0 {
+                warn!(
+                    "max_size_amplification_ratio must be a finite value above 0, got {}. \
+                     Disabling the size amplification trigger.",
+                    ratio
+                );
+                options.max_size_amplification_ratio = None;
+            }
+        }
         Self {
             options,
             max_concurrent_compactions,
@@ -382,6 +398,13 @@ impl SizeTieredCompactionScheduler {
         tree: &TreeState,
         next_fresh_sr_id: &mut u32,
     ) -> Option<CompactionSpec> {
+        let size_amplification = match self.check_size_amplification(tree) {
+            SizeAmplification::Ready(sources) => {
+                return Some(self.create_sorted_run_compaction(&tree.prefix, sources));
+            }
+            other => other,
+        };
+
         // compact l0s if required
         let l0_candidates: VecDeque<_> = tree.l0.iter().copied().collect();
         if let Some(mut l0_candidates) = self.clamp_min(l0_candidates) {
@@ -394,6 +417,10 @@ impl SizeTieredCompactionScheduler {
                 *next_fresh_sr_id = next_fresh_sr_id.saturating_add(1);
                 return Some(self.create_compaction(&tree.prefix, l0_candidates, dst));
             }
+        }
+
+        if matches!(size_amplification, SizeAmplification::Blocked) {
+            return None;
         }
 
         // try to compact the lower levels
@@ -431,6 +458,34 @@ impl SizeTieredCompactionScheduler {
             }
         }
         None
+    }
+
+    fn check_size_amplification(&self, tree: &TreeState) -> SizeAmplification {
+        let Some(ratio) = self.options.max_size_amplification_ratio else {
+            return SizeAmplification::NotTriggered;
+        };
+        let Some((oldest, newer)) = tree.srs.split_last() else {
+            return SizeAmplification::NotTriggered;
+        };
+        if newer.is_empty() || self.options.max_compaction_sources < 2 {
+            return SizeAmplification::NotTriggered;
+        }
+        let newer_size: u64 = newer.iter().map(|src| src.size).sum();
+        if (newer_size as f64) < ratio * (oldest.size as f64) {
+            return SizeAmplification::NotTriggered;
+        }
+        let start = tree
+            .srs
+            .len()
+            .saturating_sub(self.options.max_compaction_sources);
+        let sources: VecDeque<CompactionSource> = tree.srs[start..].iter().copied().collect();
+        if sources
+            .iter()
+            .any(|src| !tree.conflicts.check_source(src.source))
+        {
+            return SizeAmplification::Blocked;
+        }
+        SizeAmplification::Ready(sources)
     }
 
     fn clamp_min(&self, sources: VecDeque<CompactionSource>) -> Option<VecDeque<CompactionSource>> {
@@ -1570,6 +1625,238 @@ mod tests {
 
         // then:
         assert!(result.is_err());
+    }
+
+    const MIB: u64 = 1024 * 1024;
+
+    fn size_amplification_scheduler(
+        ratio: Option<f64>,
+        min_compaction_sources: usize,
+        max_compaction_sources: usize,
+        max_concurrent_compactions: usize,
+    ) -> SizeTieredCompactionScheduler {
+        SizeTieredCompactionScheduler::new(
+            SizeTieredCompactionSchedulerOptions {
+                min_compaction_sources,
+                max_compaction_sources,
+                max_size_amplification_ratio: ratio,
+                ..Default::default()
+            },
+            max_concurrent_compactions,
+        )
+    }
+
+    fn create_srs_newest_first(sizes_mib: &[u64]) -> Vec<SortedRun> {
+        let count = sizes_mib.len() as u32;
+        sizes_mib
+            .iter()
+            .enumerate()
+            .map(|(i, size)| create_sr2(count - 1 - i as u32, size * MIB))
+            .collect()
+    }
+
+    #[test]
+    fn test_size_amplification_none_keeps_size_tiered_proposals() {
+        let state = create_compactor_state(create_db_state(
+            VecDeque::new(),
+            create_srs_newest_first(&[100, 1, 1, 1, 1, 10]),
+        ));
+
+        let disabled = size_amplification_scheduler(None, 4, 8, 4);
+        let default_scheduler = SizeTieredCompactionScheduler::default();
+
+        let proposed = disabled.propose(&(&state).into());
+        assert_eq!(proposed, vec![create_sr_compaction(vec![5, 4, 3, 2, 1])]);
+        assert_eq!(proposed, default_scheduler.propose(&(&state).into()));
+    }
+
+    #[test]
+    fn test_size_amplification_below_ratio_does_not_trigger() {
+        let state = create_compactor_state(create_db_state(
+            VecDeque::new(),
+            create_srs_newest_first(&[1, 2, 3, 8, 12, 40, 200]),
+        ));
+
+        let enabled = size_amplification_scheduler(Some(2.0), 4, 8, 4);
+        let disabled = size_amplification_scheduler(None, 4, 8, 4);
+
+        assert_eq!(
+            enabled.propose(&(&state).into()),
+            disabled.propose(&(&state).into())
+        );
+    }
+
+    #[test]
+    fn test_size_amplification_compacts_all_runs_into_oldest() {
+        let l0 = [
+            create_sst_view(1),
+            create_sst_view(1),
+            create_sst_view(1),
+            create_sst_view(1),
+        ];
+        let state = create_compactor_state(create_db_state(
+            l0.iter().cloned().collect(),
+            create_srs_newest_first(&[100, 1, 1, 1, 1, 10]),
+        ));
+        let scheduler = size_amplification_scheduler(Some(2.0), 4, 8, 4);
+
+        let proposed = scheduler.propose(&(&state).into());
+
+        let size_amplification = create_sr_compaction(vec![5, 4, 3, 2, 1, 0]);
+        assert_eq!(
+            proposed,
+            vec![size_amplification.clone(), create_l0_compaction(&l0, 6)]
+        );
+        assert_eq!(size_amplification.destination(), Some(0));
+        assert!(scheduler
+            .validate(&(&state).into(), &size_amplification)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_size_amplification_at_exact_ratio_triggers() {
+        let state = create_compactor_state(create_db_state(
+            VecDeque::new(),
+            create_srs_newest_first(&[2, 2, 2]),
+        ));
+        let scheduler = size_amplification_scheduler(Some(2.0), 4, 8, 4);
+
+        assert_eq!(
+            scheduler.propose(&(&state).into()),
+            vec![create_sr_compaction(vec![2, 1, 0])]
+        );
+    }
+
+    #[test]
+    fn test_size_amplification_respects_max_concurrent_compactions() {
+        let l0 = [
+            create_sst_view(1),
+            create_sst_view(1),
+            create_sst_view(1),
+            create_sst_view(1),
+        ];
+        let state = create_compactor_state(create_db_state(
+            l0.iter().cloned().collect(),
+            create_srs_newest_first(&[100, 1, 1, 1, 1, 10]),
+        ));
+        let scheduler = size_amplification_scheduler(Some(2.0), 4, 8, 1);
+
+        assert_eq!(
+            scheduler.propose(&(&state).into()),
+            vec![create_sr_compaction(vec![5, 4, 3, 2, 1, 0])]
+        );
+    }
+
+    #[test]
+    fn test_size_amplification_busy_run_blocks_job_but_not_l0() {
+        let l0 = [
+            create_sst_view(1),
+            create_sst_view(1),
+            create_sst_view(1),
+            create_sst_view(1),
+        ];
+        let mut state = create_compactor_state(create_db_state(
+            l0.iter().cloned().collect(),
+            create_srs_newest_first(&[100, 1, 1, 1, 1, 10]),
+        ));
+        state.insert_compaction_for_test(
+            Compaction::new(ulid::Ulid::new(), create_sr_compaction(vec![2, 1]))
+                .with_status(CompactionStatus::Running),
+        );
+
+        let enabled = size_amplification_scheduler(Some(2.0), 2, 8, 4);
+        let disabled = size_amplification_scheduler(None, 2, 8, 4);
+
+        assert_eq!(
+            disabled.propose(&(&state).into()),
+            vec![
+                create_l0_compaction(&l0, 6),
+                create_sr_compaction(vec![5, 4, 3])
+            ]
+        );
+        assert_eq!(
+            enabled.propose(&(&state).into()),
+            vec![create_l0_compaction(&l0, 6)]
+        );
+    }
+
+    #[test]
+    fn test_size_amplification_job_in_flight_blocks_new_job() {
+        let mut state = create_compactor_state(create_db_state(
+            VecDeque::new(),
+            create_srs_newest_first(&[100, 1, 1, 1, 1, 10]),
+        ));
+        let scheduler = size_amplification_scheduler(Some(2.0), 2, 8, 4);
+
+        let proposed = scheduler.propose(&(&state).into());
+        assert_eq!(proposed, vec![create_sr_compaction(vec![5, 4, 3, 2, 1, 0])]);
+        state
+            .add_compaction(Compaction::new(ulid::Ulid::new(), proposed[0].clone()))
+            .unwrap();
+
+        assert!(scheduler.propose(&(&state).into()).is_empty());
+    }
+
+    #[rstest::rstest]
+    #[case::tiny_ratio(Some(0.001))]
+    #[case::large_ratio(Some(2.0))]
+    fn test_size_amplification_single_run_never_triggers(#[case] ratio: Option<f64>) {
+        let state = create_compactor_state(create_db_state(
+            VecDeque::new(),
+            create_srs_newest_first(&[10]),
+        ));
+        let scheduler = size_amplification_scheduler(ratio, 4, 8, 4);
+
+        assert!(scheduler.propose(&(&state).into()).is_empty());
+    }
+
+    #[rstest::rstest]
+    #[case::zero(0.0)]
+    #[case::negative(-1.0)]
+    #[case::nan(f64::NAN)]
+    #[case::infinite(f64::INFINITY)]
+    fn test_size_amplification_invalid_ratio_is_disabled(#[case] ratio: f64) {
+        let state = create_compactor_state(create_db_state(
+            VecDeque::new(),
+            create_srs_newest_first(&[100, 1, 1, 1, 1, 10]),
+        ));
+        let scheduler = size_amplification_scheduler(Some(ratio), 4, 8, 4);
+
+        assert_eq!(scheduler.options.max_size_amplification_ratio, None);
+        assert_eq!(
+            scheduler.propose(&(&state).into()),
+            vec![create_sr_compaction(vec![5, 4, 3, 2, 1])]
+        );
+    }
+
+    #[test]
+    fn test_size_amplification_caps_job_to_oldest_runs_at_source_limit() {
+        let state = create_compactor_state(create_db_state(
+            VecDeque::new(),
+            create_srs_newest_first(&[10, 10, 10, 10, 1]),
+        ));
+        let scheduler = size_amplification_scheduler(Some(2.0), 4, 3, 4);
+
+        let proposed = scheduler.propose(&(&state).into());
+
+        let capped = create_sr_compaction(vec![2, 1, 0]);
+        assert_eq!(proposed, vec![capped.clone()]);
+        assert!(scheduler.validate(&(&state).into(), &capped).is_ok());
+    }
+
+    #[test]
+    fn test_size_amplification_skips_when_source_limit_below_two() {
+        let state = create_compactor_state(create_db_state(
+            VecDeque::new(),
+            create_srs_newest_first(&[10, 10, 1]),
+        ));
+        let enabled = size_amplification_scheduler(Some(2.0), 1, 1, 4);
+        let disabled = size_amplification_scheduler(None, 1, 1, 4);
+
+        assert_eq!(
+            enabled.propose(&(&state).into()),
+            disabled.propose(&(&state).into())
+        );
     }
 
     fn create_sst_view(size: u64) -> SsTableView {

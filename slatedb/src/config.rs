@@ -1496,6 +1496,8 @@ pub struct SizeTieredCompactionSchedulerOptions {
     /// The fallback tries consecutive groups from newest to oldest. It stops each group
     /// at `max_compaction_sources` and keeps the newest eligible sources in that group.
     pub sorted_run_consolidation_threshold: usize,
+
+    pub max_size_amplification_ratio: Option<f64>,
 }
 
 impl Default for SizeTieredCompactionSchedulerOptions {
@@ -1505,6 +1507,7 @@ impl Default for SizeTieredCompactionSchedulerOptions {
             max_compaction_sources: 8,
             include_size_threshold: 4.0,
             sorted_run_consolidation_threshold: 0,
+            max_size_amplification_ratio: None,
         }
     }
 }
@@ -1550,6 +1553,15 @@ impl From<&HashMap<String, String>> for SizeTieredCompactionSchedulerOptions {
                         );
                     }
                 },
+                "max_size_amplification_ratio" => match value.parse::<f64>() {
+                    Ok(parsed) => options.max_size_amplification_ratio = Some(parsed),
+                    Err(err) => {
+                        warn!(
+                            "invalid scheduler option value for max_size_amplification_ratio: '{}': {}",
+                            value, err
+                        );
+                    }
+                },
                 _ => {
                     warn!("unknown scheduler option '{}'; ignoring", key);
                 }
@@ -1585,6 +1597,12 @@ impl From<SizeTieredCompactionSchedulerOptions> for HashMap<String, String> {
             "sorted_run_consolidation_threshold".to_string(),
             options.sorted_run_consolidation_threshold.to_string(),
         );
+        if let Some(ratio) = options.max_size_amplification_ratio {
+            map.insert(
+                "max_size_amplification_ratio".to_string(),
+                ratio.to_string(),
+            );
+        }
         map
     }
 }
@@ -2163,6 +2181,7 @@ object_store_cache_options:
             max_compaction_sources: 9,
             include_size_threshold: 7.0,
             sorted_run_consolidation_threshold: 5,
+            max_size_amplification_ratio: Some(2.5),
         };
 
         let map: HashMap<String, String> = options.into();
@@ -2172,6 +2191,38 @@ object_store_cache_options:
         assert_eq!(roundtripped.max_compaction_sources, 9);
         assert_eq!(roundtripped.include_size_threshold, 7.0);
         assert_eq!(roundtripped.sorted_run_consolidation_threshold, 5);
+        assert_eq!(roundtripped.max_size_amplification_ratio, Some(2.5));
+    }
+
+    #[test]
+    fn test_size_tiered_options_without_size_amplification_ratio() {
+        let map: HashMap<String, String> = HashMap::from([
+            ("min_compaction_sources".to_string(), "3".to_string()),
+            ("max_compaction_sources".to_string(), "9".to_string()),
+            ("include_size_threshold".to_string(), "7.0".to_string()),
+            (
+                "sorted_run_consolidation_threshold".to_string(),
+                "5".to_string(),
+            ),
+        ]);
+
+        let options = SizeTieredCompactionSchedulerOptions::from(&map);
+
+        assert_eq!(options.max_size_amplification_ratio, None);
+        let map: HashMap<String, String> = SizeTieredCompactionSchedulerOptions::default().into();
+        assert!(!map.contains_key("max_size_amplification_ratio"));
+    }
+
+    #[test]
+    fn test_compactor_options_without_size_amplification_ratio_parse() {
+        let mut value = serde_json::to_value(CompactorOptions::default()).unwrap();
+        value["scheduler_options"] = serde_json::json!({"min_compaction_sources": "2"});
+
+        let options: CompactorOptions = serde_json::from_value(value).unwrap();
+        let scheduler = SizeTieredCompactionSchedulerOptions::from(&options.scheduler_options);
+
+        assert_eq!(scheduler.min_compaction_sources, 2);
+        assert_eq!(scheduler.max_size_amplification_ratio, None);
     }
 
     #[test]
