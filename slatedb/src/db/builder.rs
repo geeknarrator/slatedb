@@ -135,7 +135,7 @@ use crate::compactor::{CompactionSchedulerSupplier, Compactor};
 use crate::config::DbReaderOptions;
 use crate::config::GarbageCollectorOptions;
 use crate::config::{CompactionWorkerOptions, CompactorOptions};
-use crate::config::{Settings, SstBlockSize};
+use crate::config::{Settings, SstBlockSize, UnionRunOrder};
 use crate::db::Db;
 use crate::db::DbInner;
 use crate::db_cache::SplitCache;
@@ -2172,6 +2172,7 @@ pub struct CloneBuilder<R: RangeBounds<Bytes> + Clone = (Bound<Bytes>, Bound<Byt
     projection_range: Option<R>,
     segment_filter: Option<SegmentFilterFn>,
     segment_projection: Option<SegmentProjectionFn>,
+    union_run_order: UnionRunOrder,
 }
 
 impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
@@ -2191,6 +2192,7 @@ impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
             projection_range: None,
             segment_filter: None,
             segment_projection: None,
+            union_run_order: UnionRunOrder::default(),
         }
     }
 
@@ -2261,6 +2263,11 @@ impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
         self
     }
 
+    pub fn with_union_run_order(mut self, union_run_order: UnionRunOrder) -> Self {
+        self.union_run_order = union_run_order;
+        self
+    }
+
     pub fn with_system_clock(mut self, system_clock: Arc<dyn SystemClock>) -> Self {
         self.system_clock = Some(system_clock);
         self
@@ -2294,6 +2301,7 @@ impl<R: RangeBounds<Bytes> + Clone> CloneBuilder<R> {
             self.projection_range,
             self.segment_filter,
             self.segment_projection,
+            self.union_run_order,
         )
         .await
         .map_err(crate::Error::from)

@@ -1,6 +1,6 @@
 use crate::bytes_range::BytesRange;
 use crate::checkpoint::Checkpoint;
-use crate::config::CheckpointOptions;
+use crate::config::{CheckpointOptions, UnionRunOrder};
 
 use crate::db::builder::CloneSourceSpec;
 use crate::error::SlateDBError;
@@ -54,6 +54,7 @@ pub(crate) async fn create_clone<P: Into<Path>, R: RangeBounds<Bytes> + Clone>(
     projection_range: Option<R>,
     segment_filter: Option<SegmentFilterFn>,
     segment_projection: Option<SegmentProjectionFn>,
+    union_run_order: UnionRunOrder,
 ) -> Result<(), SlateDBError> {
     let clone_path = clone_path.into();
 
@@ -72,6 +73,7 @@ pub(crate) async fn create_clone<P: Into<Path>, R: RangeBounds<Bytes> + Clone>(
         projection_range,
         segment_filter,
         segment_projection,
+        union_run_order,
         wal_admin.as_ref(),
     )
     .await?;
@@ -105,6 +107,7 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
     projection_range: Option<R>,
     segment_filter: Option<SegmentFilterFn>,
     segment_projection: Option<SegmentProjectionFn>,
+    union_run_order: UnionRunOrder,
     wal_admin: &dyn WalAdmin,
 ) -> Result<CreateCloneManifestResult, SlateDBError> {
     let clone_manifest_store = Arc::new(ManifestStore::new(&clone_path, object_store.clone()));
@@ -199,7 +202,11 @@ async fn create_clone_manifest<R: RangeBounds<Bytes> + Clone>(
                     }
                     [..] => {
                         validate_no_data_wal(&sources, wal_admin).await?;
-                        Manifest::cloned_from_union(sources, rand.clone())?
+                        Manifest::cloned_from_union_with_run_order(
+                            sources,
+                            rand.clone(),
+                            union_run_order,
+                        )?
                     }
                 };
                 manifest.core.initialized = false;
@@ -589,7 +596,7 @@ mod tests {
     use super::{SegmentFilterFn, SegmentProjectionFn};
     use crate::config::{
         CheckpointOptions, CheckpointScope, CloseOptions, FlushOptions, FlushType, PutOptions,
-        Settings, WriteOptions,
+        Settings, UnionRunOrder, WriteOptions,
     };
     use crate::db::builder::CloneSourceSpec;
     use crate::db::Db;
@@ -699,6 +706,7 @@ mod tests {
             projection_range,
             segment_filter,
             segment_projection,
+            UnionRunOrder::Concat,
         )
         .await
     }
@@ -949,6 +957,7 @@ mod tests {
             None,
             None,
             None,
+            UnionRunOrder::Concat,
         )
         .await
         .unwrap();
@@ -998,6 +1007,7 @@ mod tests {
             None,
             None,
             None,
+            UnionRunOrder::Concat,
         )
         .await
         .unwrap();
@@ -2364,6 +2374,112 @@ mod tests {
         )
         .await;
         clone_db.close().await.unwrap();
+    }
+
+    async fn create_parent_with_sorted_runs(
+        parent_path: &Path,
+        object_store: Arc<dyn ObjectStore>,
+        system_clock: Arc<dyn SystemClock>,
+        runs: &[(u64, u64)],
+        first: &str,
+        last: &str,
+    ) {
+        use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableInfo, SsTableView};
+        use crate::format::sst::SST_FORMAT_VERSION_LATEST;
+        let mut core = ManifestCore::new();
+        Arc::make_mut(&mut core.tree).compacted = runs
+            .iter()
+            .enumerate()
+            .map(|(idx, (size_mb, t_ms))| {
+                let id = ulid::Ulid::from_parts(*t_ms, rand::random::<u128>());
+                let handle = SsTableHandle::new(
+                    SsTableId::new(id),
+                    SST_FORMAT_VERSION_LATEST,
+                    SsTableInfo {
+                        first_entry: Some(Bytes::copy_from_slice(first.as_bytes())),
+                        last_entry: Some(Bytes::copy_from_slice(last.as_bytes())),
+                        index_offset: size_mb * 1_048_576,
+                        ..SsTableInfo::default()
+                    },
+                );
+                SortedRun::new(
+                    (runs.len() - 1 - idx) as u32,
+                    vec![SsTableView::new(id, handle)],
+                )
+            })
+            .collect();
+        StoredManifest::create_new_db(
+            Arc::new(ManifestStore::new(parent_path, object_store)),
+            core,
+            system_clock,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[rstest::rstest]
+    #[case(None, vec![20, 5, 1, 150, 30, 2])]
+    #[case(Some(UnionRunOrder::Concat), vec![20, 5, 1, 150, 30, 2])]
+    #[case(Some(UnionRunOrder::AgeInterleave), vec![20, 150, 30, 5, 1, 2])]
+    #[case(
+        Some(UnionRunOrder::BandInterleave { threshold: 4.0, max_group_len: Some(8) }),
+        vec![150, 30, 20, 5, 2, 1]
+    )]
+    #[tokio::test]
+    async fn should_order_union_sorted_runs_with_union_run_order(
+        #[case] order: Option<UnionRunOrder>,
+        #[case] want_mb: Vec<u64>,
+    ) {
+        let object_store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let system_clock: Arc<dyn SystemClock> = Arc::new(DefaultSystemClock::new());
+        let parent_path_a = Path::from("/tmp/test_parent_run_order_a");
+        let parent_path_b = Path::from("/tmp/test_parent_run_order_b");
+        let clone_path = Path::from("/tmp/test_clone_run_order");
+        create_parent_with_sorted_runs(
+            &parent_path_a,
+            object_store.clone(),
+            system_clock.clone(),
+            &[(20, 100), (5, 60), (1, 20)],
+            "a",
+            "l",
+        )
+        .await;
+        create_parent_with_sorted_runs(
+            &parent_path_b,
+            object_store.clone(),
+            system_clock.clone(),
+            &[(150, 90), (30, 70), (2, 10)],
+            "m",
+            "z",
+        )
+        .await;
+
+        let admin = crate::admin::AdminBuilder::new(clone_path.clone(), object_store.clone())
+            .with_system_clock(system_clock.clone())
+            .build();
+        let mut builder = admin
+            .create_clone_builder_from_source(CloneSourceSpec::new(parent_path_a))
+            .with_source(CloneSourceSpec::new(parent_path_b));
+        if let Some(order) = order {
+            builder = builder.with_union_run_order(order);
+        }
+        builder.build().await.unwrap();
+
+        let manifest = StoredManifest::load(
+            Arc::new(ManifestStore::new(&clone_path, object_store)),
+            system_clock,
+        )
+        .await
+        .unwrap();
+        let tree = &manifest.manifest().core.tree;
+        let got_mb: Vec<u64> = tree
+            .compacted
+            .iter()
+            .map(|sr| sr.estimate_visible_size() / 1_048_576)
+            .collect();
+        assert_eq!(got_mb, want_mb);
+        let got_ids: Vec<u32> = tree.compacted.iter().map(|sr| sr.id).collect();
+        assert_eq!(got_ids, vec![5, 4, 3, 2, 1, 0]);
     }
 
     #[cfg(feature = "wal_disable")]
