@@ -7,6 +7,7 @@ use std::sync::Arc;
 use crate::bytes_range::BytesRange;
 use crate::checkpoint::Checkpoint;
 use crate::clone::{CloneSource, SegmentFilterFn, SegmentProjectionFn};
+use crate::config::UnionRunOrder;
 use crate::error::SlateDBError;
 use crate::seq_tracker::SequenceTracker;
 use crate::utils::IdGenerator;
@@ -26,6 +27,132 @@ pub use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableInfo, SsTa
 /// The per-source trees a union merges into each segment, keyed by segment
 /// prefix and ordered within a segment by that segment's start key.
 type SegmentContributors<'a> = BTreeMap<Bytes, Vec<&'a LsmTreeState>>;
+
+fn run_newest_sst_ms(run: &SortedRun) -> u64 {
+    run.sst_views()
+        .iter()
+        .map(|v| v.sst.id.value().timestamp_ms())
+        .max()
+        .unwrap_or(0)
+}
+
+pub(crate) fn ordered_union_runs(trees: &[&LsmTreeState], order: UnionRunOrder) -> Vec<SortedRun> {
+    if order == UnionRunOrder::Concat {
+        return trees
+            .iter()
+            .flat_map(|t| t.compacted.iter().cloned())
+            .collect();
+    }
+    let mut runs: Vec<&SortedRun> = Vec::new();
+    let mut parts: Vec<Vec<usize>> = Vec::new();
+    for t in trees {
+        let mut part = Vec::new();
+        for r in &t.compacted {
+            part.push(runs.len());
+            runs.push(r);
+        }
+        parts.push(part);
+    }
+    let n = runs.len();
+    let sizes: Vec<u64> = runs.iter().map(|r| r.estimate_visible_size()).collect();
+    let ages: Vec<u64> = runs.iter().map(|r| run_newest_sst_ms(r)).collect();
+    let eligible = |ptr: &[usize]| -> Vec<(usize, usize)> {
+        parts
+            .iter()
+            .enumerate()
+            .filter_map(|(pk, part)| part.get(ptr[pk]).map(|&h| (pk, h)))
+            .collect()
+    };
+    let fits = |thr: f32, m: u64, s: u64| -> bool { s <= ((m as f32) * thr) as u64 };
+    let band_pick = |c: &[(usize, usize)], m: u64| -> (usize, usize) {
+        if let Some(b) = c
+            .iter()
+            .filter(|(_, h)| sizes[*h] >= m)
+            .min_by_key(|(_, h)| (sizes[*h], *h))
+        {
+            *b
+        } else {
+            *c.iter()
+                .max_by_key(|(_, h)| (sizes[*h], std::cmp::Reverse(*h)))
+                .expect("non-empty candidates")
+        }
+    };
+    let lookahead = |ptr: &[usize], pk: usize, h: usize, thr: f32, cap: usize| -> usize {
+        let mut p2 = ptr.to_vec();
+        p2[pk] += 1;
+        let mut m = sizes[h];
+        let mut len = 1usize;
+        while len < cap {
+            let c: Vec<(usize, usize)> = eligible(&p2)
+                .into_iter()
+                .filter(|(_, x)| fits(thr, m, sizes[*x]))
+                .collect();
+            if c.is_empty() {
+                break;
+            }
+            let (qk, q) = band_pick(&c, m);
+            p2[qk] += 1;
+            m = m.min(sizes[q]);
+            len += 1;
+        }
+        len
+    };
+    let mut ptr = vec![0usize; parts.len()];
+    let mut seq: Vec<usize> = Vec::with_capacity(n);
+    let mut cur_min: Option<u64> = None;
+    let mut cur_len = 0usize;
+    while seq.len() < n {
+        let e = eligible(&ptr);
+        let (pk, h) = match order {
+            UnionRunOrder::Concat => *e.iter().min_by_key(|(_, h)| *h).expect("eligible head"),
+            UnionRunOrder::SizeInterleave => *e
+                .iter()
+                .min_by_key(|(_, h)| (sizes[*h], *h))
+                .expect("eligible head"),
+            UnionRunOrder::AgeInterleave => *e
+                .iter()
+                .min_by_key(|(_, h)| (std::cmp::Reverse(ages[*h]), *h))
+                .expect("eligible head"),
+            UnionRunOrder::BandInterleave {
+                threshold,
+                max_group_len,
+            } => {
+                let cap = max_group_len.unwrap_or(usize::MAX);
+                let c: Vec<(usize, usize)> = match cur_min {
+                    Some(m) if cur_len > 0 && cur_len < cap => e
+                        .iter()
+                        .copied()
+                        .filter(|(_, x)| fits(threshold, m, sizes[*x]))
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                if let (false, Some(m)) = (c.is_empty(), cur_min) {
+                    let pick = band_pick(&c, m);
+                    cur_min = Some(m.min(sizes[pick.1]));
+                    cur_len += 1;
+                    pick
+                } else {
+                    let pick = *e
+                        .iter()
+                        .max_by_key(|(pk, h)| {
+                            (
+                                lookahead(&ptr, *pk, *h, threshold, cap),
+                                std::cmp::Reverse(sizes[*h]),
+                                std::cmp::Reverse(*h),
+                            )
+                        })
+                        .expect("eligible head");
+                    cur_min = Some(sizes[pick.1]);
+                    cur_len = 1;
+                    pick
+                }
+            }
+        };
+        ptr[pk] += 1;
+        seq.push(h);
+    }
+    seq.into_iter().map(|h| runs[h].clone()).collect()
+}
 
 /// Per-LSM-tree state. Shared shape between the unsegmented tree (held directly
 /// on `ManifestCore`) and each named segment held in `ManifestCore::segments`.
@@ -1287,6 +1414,7 @@ impl Manifest {
     fn build_unsegmented_lsm_state(
         core: &mut ManifestCore,
         sources: &[&CloneSource],
+        run_order: UnionRunOrder,
     ) -> Result<(), SlateDBError> {
         let stray_prefixes: Vec<Bytes> = sources
             .iter()
@@ -1304,15 +1432,15 @@ impl Manifest {
                 stray_prefixes
             )));
         }
-        for source in sources {
-            let manifest = &source.manifest;
-            Arc::make_mut(&mut core.tree)
-                .l0
-                .extend(manifest.core.tree.l0.iter().cloned());
-            Arc::make_mut(&mut core.tree)
-                .compacted
-                .extend(manifest.core.tree.compacted.iter().cloned());
+        let trees: Vec<&LsmTreeState> = sources
+            .iter()
+            .map(|s| s.manifest.core.tree.as_ref())
+            .collect();
+        let tree = Arc::make_mut(&mut core.tree);
+        for t in &trees {
+            tree.l0.extend(t.l0.iter().cloned());
         }
+        tree.compacted = ordered_union_runs(&trees, run_order);
         Ok(())
     }
 
@@ -1322,15 +1450,19 @@ impl Manifest {
     /// `segments`, so the unioned manifest carries no placeholders.
     /// Watermarks are intentionally not carried over: the unioned manifest is
     /// a fresh DB that begins compaction tracking from scratch.
-    fn build_segmented_lsm_state(core: &mut ManifestCore, segments: SegmentContributors) {
+    fn build_segmented_lsm_state(
+        core: &mut ManifestCore,
+        segments: SegmentContributors,
+        run_order: UnionRunOrder,
+    ) {
         core.segments = segments
             .into_iter()
             .map(|(prefix, trees)| {
                 let mut merged = LsmTreeState::default();
-                for tree in trees {
+                for tree in &trees {
                     merged.l0.extend(tree.l0.iter().cloned());
-                    merged.compacted.extend(tree.compacted.iter().cloned());
                 }
+                merged.compacted = ordered_union_runs(&trees, run_order);
                 Segment {
                     prefix,
                     tree: Arc::new(merged),
@@ -1509,9 +1641,18 @@ impl Manifest {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn cloned_from_union(
         sources: Vec<CloneSource>,
         rand: Arc<DbRand>,
+    ) -> Result<Manifest, SlateDBError> {
+        Self::cloned_from_union_with_run_order(sources, rand, UnionRunOrder::Concat)
+    }
+
+    pub(crate) fn cloned_from_union_with_run_order(
+        sources: Vec<CloneSource>,
+        rand: Arc<DbRand>,
+        run_order: UnionRunOrder,
     ) -> Result<Manifest, SlateDBError> {
         let mut ranges = vec![];
         for source in &sources {
@@ -1531,10 +1672,10 @@ impl Manifest {
         if core.segment_extractor_name.is_none() {
             let all: Vec<BytesRange> = ranges.iter().map(|(_, r)| (*r).clone()).collect();
             Self::ensure_disjoint_ranges(None, &all)?;
-            Self::build_unsegmented_lsm_state(&mut core, &ordered_sources)?;
+            Self::build_unsegmented_lsm_state(&mut core, &ordered_sources, run_order)?;
         } else {
             let segments = Self::group_segments_for_union(&ordered_sources)?;
-            Self::build_segmented_lsm_state(&mut core, segments);
+            Self::build_segmented_lsm_state(&mut core, segments, run_order);
         }
         Self::renumber_union_sorted_runs(&mut core);
         Self::assign_union_l0_view_ids(&mut core, &rand);
@@ -1686,9 +1827,9 @@ mod tests {
     use crate::manifest::store::{ManifestStore, StoredManifest};
     use slatedb_common::clock::{DefaultSystemClock, SystemClock};
 
-    use super::{ExternalDb, Manifest, VersionedManifest};
+    use super::{ordered_union_runs, ExternalDb, Manifest, VersionedManifest};
     use crate::clone::{CloneSource, SegmentFilterFn, SegmentProjectionFn};
-    use crate::config::CheckpointOptions;
+    use crate::config::{CheckpointOptions, UnionRunOrder};
     use crate::db_state::{SortedRun, SsTableHandle, SsTableId, SsTableInfo, SsTableView};
     use crate::error::SlateDBError;
     use crate::format::sst::SST_FORMAT_VERSION_LATEST;
@@ -3531,6 +3672,166 @@ mod tests {
             .expect("range should be Some for manifest with sorted runs");
         assert_eq!(range.start_bound(), Bound::Included(&Bytes::from("a")));
         assert_eq!(range.end_bound(), Bound::Unbounded);
+    }
+
+    fn band_order(max_group_len: Option<usize>) -> UnionRunOrder {
+        UnionRunOrder::BandInterleave {
+            threshold: 4.0,
+            max_group_len,
+        }
+    }
+
+    fn order_run(size_mb: u64, t_ms: u64, first: &str, last: &str) -> SortedRun {
+        let id = Ulid::from_parts(t_ms, rand::random::<u128>());
+        let handle = SsTableHandle::new(
+            SsTableId::new(id),
+            SST_FORMAT_VERSION_LATEST,
+            SsTableInfo {
+                first_entry: Some(Bytes::copy_from_slice(first.as_bytes())),
+                last_entry: Some(Bytes::copy_from_slice(last.as_bytes())),
+                index_offset: size_mb * 1_048_576,
+                ..SsTableInfo::default()
+            },
+        );
+        SortedRun::new(0, vec![SsTableView::new(id, handle)])
+    }
+
+    fn order_tree(runs: &[(u64, u64)], first: &str, last: &str) -> LsmTreeState {
+        LsmTreeState {
+            compacted: runs
+                .iter()
+                .map(|(sz, t)| order_run(*sz, *t, first, last))
+                .collect(),
+            ..LsmTreeState::default()
+        }
+    }
+
+    fn order_mb(runs: &[SortedRun]) -> Vec<u64> {
+        runs.iter()
+            .map(|r| r.estimate_visible_size() / 1_048_576)
+            .collect()
+    }
+
+    fn order_view_key(r: &SortedRun) -> Vec<(Ulid, SsTableId, Option<BytesRange>)> {
+        r.sst_views()
+            .iter()
+            .map(|v| (v.id, v.sst.id, v.visible_range.clone()))
+            .collect()
+    }
+
+    fn assert_order_invariants(trees: &[&LsmTreeState], out: &[SortedRun]) {
+        let total: usize = trees.iter().map(|t| t.compacted.len()).sum();
+        assert_eq!(out.len(), total);
+        let out_keys: Vec<_> = out.iter().map(order_view_key).collect();
+        let mut seen = HashSet::new();
+        for t in trees {
+            let mut last_pos: Option<usize> = None;
+            for r in &t.compacted {
+                let k = order_view_key(r);
+                let pos = out_keys
+                    .iter()
+                    .position(|x| *x == k)
+                    .expect("every source run appears with unchanged views");
+                assert!(seen.insert(pos), "a source run appears twice");
+                if let Some(lp) = last_pos {
+                    assert!(pos > lp, "source run order changed");
+                }
+                last_pos = Some(pos);
+            }
+        }
+    }
+
+    #[rstest]
+    #[case(UnionRunOrder::Concat, vec![20, 5, 1, 150, 30, 2])]
+    #[case(UnionRunOrder::SizeInterleave, vec![20, 5, 1, 150, 30, 2])]
+    #[case(UnionRunOrder::AgeInterleave, vec![20, 150, 30, 5, 1, 2])]
+    #[case(band_order(None), vec![150, 30, 20, 5, 2, 1])]
+    #[case(band_order(Some(8)), vec![150, 30, 20, 5, 2, 1])]
+    fn test_union_order_example(#[case] order: UnionRunOrder, #[case] want: Vec<u64>) {
+        let a = order_tree(&[(20, 100), (5, 60), (1, 20)], "a", "l");
+        let b = order_tree(&[(150, 90), (30, 70), (2, 10)], "m", "z");
+        let trees = [&a, &b];
+        let out = ordered_union_runs(&trees, order);
+        assert_order_invariants(&trees, &out);
+        assert_eq!(order_mb(&out), want);
+    }
+
+    #[rstest]
+    #[case(UnionRunOrder::SizeInterleave, vec![1, 4, 8, 10, 9, 40, 50])]
+    #[case(UnionRunOrder::AgeInterleave, vec![1, 8, 4, 40, 10, 9, 50])]
+    #[case(band_order(None), vec![8, 10, 9, 1, 4, 40, 50])]
+    fn test_union_order_three_sources(#[case] order: UnionRunOrder, #[case] want: Vec<u64>) {
+        let a = order_tree(&[(1, 900), (4, 700), (40, 500)], "a", "f");
+        let b = order_tree(&[(8, 800), (50, 100)], "g", "m");
+        let c = order_tree(&[(10, 400), (9, 300)], "n", "z");
+        let trees = [&a, &b, &c];
+        let out = ordered_union_runs(&trees, order);
+        assert_order_invariants(&trees, &out);
+        assert_eq!(order_mb(&out), want);
+    }
+
+    #[test]
+    fn test_union_order_band_cap8_starts_new_group() {
+        let ones: Vec<(u64, u64)> = (0..9).map(|i| (1, 1000 - i)).collect();
+        let a = order_tree(&ones, "a", "l");
+        let b = order_tree(&[(100, 500)], "m", "z");
+        let trees = [&a, &b];
+        let nocap = ordered_union_runs(&trees, band_order(None));
+        let cap = ordered_union_runs(&trees, band_order(Some(8)));
+        assert_order_invariants(&trees, &nocap);
+        assert_order_invariants(&trees, &cap);
+        assert_eq!(order_mb(&nocap), vec![100, 1, 1, 1, 1, 1, 1, 1, 1, 1]);
+        assert_eq!(order_mb(&cap), vec![1, 1, 1, 1, 1, 1, 1, 1, 100, 1]);
+    }
+
+    #[test]
+    fn test_union_order_keeps_projected_views_and_source_order() {
+        let mut ids: HashMap<String, SsTableId> = HashMap::new();
+        let mut id_of = |alias: &str| -> SsTableId {
+            *ids.entry(alias.to_string())
+                .or_insert_with(|| SsTableId::from(Ulid::new()))
+        };
+        let m1 = build_manifest(
+            &SimpleManifest {
+                l0: vec![],
+                sorted_runs: vec![
+                    vec![
+                        SstEntry::projected("a2", "a", "a".."c"),
+                        SstEntry::projected("a2b", "c", "c".."m"),
+                    ],
+                    vec![SstEntry::projected("a1", "a", "a".."m")],
+                    vec![SstEntry::projected("a0", "a", "b".."m")],
+                ],
+            },
+            &mut id_of,
+        );
+        let m2 = build_manifest(
+            &SimpleManifest {
+                l0: vec![],
+                sorted_runs: vec![
+                    vec![SstEntry::projected("b1", "m", "m"..)],
+                    vec![SstEntry::projected("b0", "m", "n"..)],
+                ],
+            },
+            &mut id_of,
+        );
+        let trees = [m1.core.tree.as_ref(), m2.core.tree.as_ref()];
+        for order in [
+            UnionRunOrder::Concat,
+            UnionRunOrder::SizeInterleave,
+            UnionRunOrder::AgeInterleave,
+            band_order(None),
+            band_order(Some(8)),
+        ] {
+            let out = ordered_union_runs(&trees, order);
+            assert_order_invariants(&trees, &out);
+        }
+        let concat = ordered_union_runs(&trees, UnionRunOrder::Concat);
+        let want: Vec<_> = trees
+            .iter()
+            .flat_map(|t| t.compacted.iter().map(order_view_key))
+            .collect();
+        assert_eq!(concat.iter().map(order_view_key).collect::<Vec<_>>(), want);
     }
 
     fn build_manifest<F>(manifest: &SimpleManifest, mut sst_id_fn: F) -> Manifest

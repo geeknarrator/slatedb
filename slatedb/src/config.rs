@@ -266,6 +266,18 @@ impl SstBlockSize {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub enum UnionRunOrder {
+    #[default]
+    Concat,
+    SizeInterleave,
+    AgeInterleave,
+    BandInterleave {
+        threshold: f32,
+        max_group_len: Option<usize>,
+    },
+}
+
 /// Describes the durability of data based on the medium (e.g. in-memory, object storags)
 /// that the data is currently stored in. Currently this is used to define a
 /// durability filter for data served by a read.
